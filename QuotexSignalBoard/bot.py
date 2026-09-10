@@ -166,7 +166,6 @@ def run_engine():
 worker_thread = threading.Thread(target=run_engine, daemon=True)
 worker_thread.start()
 
-# ১ মিনিটের হাইপোথেটিক্যাল আউটকাম ওয়ার্কার
 def run_outcome_worker():
     while True:
         time.sleep(30)
@@ -195,7 +194,7 @@ def run_outcome_worker():
                             res = "WIN" if expiry_price > entry else ("LOSS" if expiry_price < entry else "TIE")
                         else:
                             res = "WIN" if expiry_price < entry else ("LOSS" if expiry_price > entry else "TIE")
-                            
+                        
                         tz = pytz.timezone(TIMEZONE_NAME)
                         now = datetime.datetime.now(tz)
                         

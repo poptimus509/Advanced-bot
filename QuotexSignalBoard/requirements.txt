@@ -1,7 +1,7 @@
-Flask
-gunicorn
+fastapi
+uvicorn
+websockets
 pandas
 numpy
 requests
-pusher
-websocket-client
+python-telegram-bot

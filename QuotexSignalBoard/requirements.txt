@@ -2,6 +2,7 @@ flask
 fastapi
 uvicorn
 websockets
+websocket-client
 pandas
 numpy
 requests

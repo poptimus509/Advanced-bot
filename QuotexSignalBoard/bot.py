@@ -128,7 +128,6 @@ def on_candle_closed(event: CandleClosedEvent):
 
     direction, score, quality, details = evaluate_strategy(df_5m, df_15m)
     
-    # ডিবাগ করার জন্য লগ যুক্ত করা হলো যাতে রেন্ডার লগসে স্কোর দেখা যায়
     logger.info(f"[{display_name}] Strategy Evaluated -> Direction: {direction} | Score: {score}/11 | Quality: {quality} | Threshold Required: {SIGNAL_THRESHOLD_CALL_PUT}")
 
     signal_id = f"{event.symbol}_{event.timeframe}_{event.candle_epoch}"
@@ -156,13 +155,28 @@ def on_candle_closed(event: CandleClosedEvent):
 event_dispatcher.subscribe(on_candle_closed)
 
 def run_engine():
-    deriv_client.start()
-    server_epoch = deriv_client.get_server_epoch()
-    for deriv_symbol in FOREX_PAIRS.keys():
-        candles = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=120, granularity=60)
-        if candles and deriv_symbol in candle_managers:
-            candle_managers[deriv_symbol].seed_historical_candles("1M", candles, server_epoch)
-        time.sleep(0.1)
+    logger.info("=== Background engine thread starting ===")
+    try:
+        deriv_client.start()
+        logger.info("Deriv client start signal sent. Waiting for server epoch...")
+        time.sleep(2)
+        server_epoch = deriv_client.get_server_epoch()
+        logger.info(f"Server epoch acquired: {server_epoch}")
+        
+        for deriv_symbol in FOREX_PAIRS.keys():
+            logger.info(f"Fetching historical candles for {deriv_symbol}...")
+            candles = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=120, granularity=60)
+            if candles and deriv_symbol in candle_managers:
+                candle_managers[deriv_symbol].seed_historical_candles("1M", candles, server_epoch)
+                logger.info(f"Seeded candles for {deriv_symbol}")
+            else:
+                logger.warning(f"Failed or empty candles for {deriv_symbol}")
+            time.sleep(0.2)
+            
+        logger.info("=== All pairs seeded successfully. Entering monitoring loop ===")
+    except Exception as e:
+        logger.error(f"Critical error in run_engine: {e}", exc_info=True)
+        
     while True:
         time.sleep(15)
 

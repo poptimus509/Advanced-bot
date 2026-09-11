@@ -267,17 +267,30 @@ def api_performance():
 def api_pairs():
     return jsonify(FOREX_PAIRS)
 
-# Initialize background threads globally so Gunicorn loads them automatically on Render
-try:
-    engine_thread = threading.Thread(target=run_engine, daemon=True)
-    engine_thread.start()
-    
-    outcome_thread = threading.Thread(target=run_outcome_worker, daemon=True)
-    outcome_thread.start()
-    logger.info("Background engine & outcome worker threads successfully initialized.")
-except Exception as e:
-    logger.error(f"Failed to initialize background threads: {e}")
+# Lazy initialization to start background threads safely inside Gunicorn worker process
+_threads_started = False
+_threads_lock = threading.Lock()
+
+def start_background_threads_once():
+    global _threads_started
+    with _threads_lock:
+        if not _threads_started:
+            try:
+                engine_thread = threading.Thread(target=run_engine, daemon=True)
+                engine_thread.start()
+                
+                outcome_thread = threading.Thread(target=run_outcome_worker, daemon=True)
+                outcome_thread.start()
+                logger.info("Background engine & outcome worker threads successfully initialized in worker process.")
+                _threads_started = True
+            except Exception as e:
+                logger.error(f"Failed to initialize background threads: {e}")
+
+@app.before_request
+def before_request_func():
+    start_background_threads_once()
 
 if __name__ == "__main__":
+    start_background_threads_once()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)

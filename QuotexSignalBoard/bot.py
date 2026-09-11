@@ -159,7 +159,7 @@ def run_engine():
     try:
         deriv_client.start()
         logger.info("Deriv client start signal sent. Waiting for server epoch...")
-        time.sleep(2)
+        time.sleep(3)
         server_epoch = deriv_client.get_server_epoch()
         logger.info(f"Server epoch acquired: {server_epoch}")
         
@@ -173,7 +173,21 @@ def run_engine():
                 logger.warning(f"Failed or empty candles for {deriv_symbol}")
             time.sleep(0.2)
             
-        logger.info("=== All pairs seeded successfully. Entering monitoring loop ===")
+        logger.info("=== All pairs seeded successfully. Subscribing to live ticks ===")
+        
+        # ডেরিভ ওয়েবসকেটে লাইভ টিক সাবস্ক্রিপশন রিকোয়েস্ট পাঠানো হচ্ছে
+        for deriv_symbol in FOREX_PAIRS.keys():
+            try:
+                if hasattr(deriv_client, 'subscribe_ticks'):
+                    deriv_client.subscribe_ticks(deriv_symbol)
+                elif hasattr(deriv_client, 'send'):
+                    deriv_client.send({"ticks": deriv_symbol, "subscribe": 1})
+                logger.info(f"Subscribed to live ticks for: {deriv_symbol}")
+            except Exception as sub_err:
+                logger.error(f"Failed to subscribe ticks for {deriv_symbol}: {sub_err}")
+            time.sleep(0.2)
+
+        logger.info("=== Entering live monitoring loop ===")
     except Exception as e:
         logger.error(f"Critical error in run_engine: {e}", exc_info=True)
         

@@ -163,7 +163,6 @@ event_dispatcher.subscribe(on_candle_closed)
 def run_engine():
     logger.info("=== Background engine thread starting (Optimized Multi-Timeframe Strategy) ===")
     
-    # Seed historical data for all pairs before starting live ticks
     server_epoch = deriv_client.get_server_epoch()
     for deriv_symbol in FOREX_PAIRS.keys():
         try:
@@ -251,7 +250,7 @@ def api_history():
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT signal_id, display_pair, timeframe, signal_timestamp_bdt, direction, score, quality, bias_15m, entry_reference_price, exit_reference_price, result FROM signal_history ORDER BY candle_epoch DESC LIMIT 50")
-    rows = cursor.fetchall()
+    rows = `conn.cursor().fetchall()` if False else cursor.fetchall()
     conn.close()
     history = [{
         "signal_id": r[0], "pair": r[1], "timeframe": r[2], "timestamp": r[3],
@@ -268,12 +267,17 @@ def api_performance():
 def api_pairs():
     return jsonify(FOREX_PAIRS)
 
-if __name__ == "__main__":
+# Initialize background threads globally so Gunicorn loads them automatically on Render
+try:
     engine_thread = threading.Thread(target=run_engine, daemon=True)
     engine_thread.start()
     
     outcome_thread = threading.Thread(target=run_outcome_worker, daemon=True)
     outcome_thread.start()
-    
+    logger.info("Background engine & outcome worker threads successfully initialized.")
+except Exception as e:
+    logger.error(f"Failed to initialize background threads: {e}")
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)

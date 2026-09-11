@@ -233,6 +233,7 @@ def api_dashboard():
     })
 
 @app.route("/api/active-signals")
+@app.route("/api/signals/active")
 def api_active_signals():
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -267,7 +268,7 @@ def api_performance():
 def api_pairs():
     return jsonify(FOREX_PAIRS)
 
-# Lazy initialization to start background threads safely inside Gunicorn worker process
+# Lazy initialization for Gunicorn/Render worker process compatibility
 _threads_started = False
 _threads_lock = threading.Lock()
 

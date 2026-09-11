@@ -161,7 +161,7 @@ def on_candle_closed(event: CandleClosedEvent):
 event_dispatcher.subscribe(on_candle_closed)
 
 def run_engine():
-    logger.info("=== Background engine thread starting (Optimized Multi-Timeframe Strategy) ===")
+    logger.info("=== Background engine thread starting (Optimized Multi-Timeframe Strategy) ==Pclass ===")
     
     server_epoch = deriv_client.get_server_epoch()
     for deriv_symbol in FOREX_PAIRS.keys():
@@ -250,7 +250,7 @@ def api_history():
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT signal_id, display_pair, timeframe, signal_timestamp_bdt, direction, score, quality, bias_15m, entry_reference_price, exit_reference_price, result FROM signal_history ORDER BY candle_epoch DESC LIMIT 50")
-    rows = `conn.cursor().fetchall()` if False else cursor.fetchall()
+    rows = cursor.fetchall()
     conn.close()
     history = [{
         "signal_id": r[0], "pair": r[1], "timeframe": r[2], "timestamp": r[3],

@@ -56,7 +56,7 @@ deriv_client = DerivClient()
 for deriv_symbol, display_name in FOREX_PAIRS.items():
     cm = CandleManager(symbol=deriv_symbol, event_dispatcher=event_dispatcher)
     candle_managers[deriv_symbol] = cm
-    deriv_client.register_candle_manager(deriv_symbol, cm)
+    deriv_client.register_tick_handler(deriv_symbol, cm.process_tick)
 
 def save_signal_to_db(signal_id, symbol, display_name, timeframe, epoch, direction, score, quality, bias, entry_price):
     tz = pytz.timezone(TIMEZONE_NAME)
@@ -138,7 +138,6 @@ def on_candle_closed(event: CandleClosedEvent):
     signal_id = f"{event.symbol}_{event.timeframe}_{event.candle_epoch}"
     entry_price = event.candle.close
 
-    # Use config threshold directly so score >= SIGNAL_THRESHOLD_CALL_PUT triggers alerts
     STRONG_SIGNAL_THRESHOLD = SIGNAL_THRESHOLD_CALL_PUT
 
     if direction in ["CALL", "PUT"] and score >= STRONG_SIGNAL_THRESHOLD:
@@ -163,6 +162,26 @@ event_dispatcher.subscribe(on_candle_closed)
 
 def run_engine():
     logger.info("=== Background engine thread starting (Optimized Multi-Timeframe Strategy) ===")
+    
+    # Seed historical data for all pairs before starting live ticks
+    server_epoch = deriv_client.get_server_epoch()
+    for deriv_symbol in FOREX_PAIRS.keys():
+        try:
+            candles_1m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=120, granularity=60)
+            candles_5m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=100, granularity=300)
+            candles_15m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=100, granularity=900)
+            
+            if deriv_symbol in candle_managers:
+                cm = candle_managers[deriv_symbol]
+                if candles_1m:
+                    cm.seed_historical_candles("1M", candles_1m, server_epoch)
+                if candles_5m:
+                    cm.seed_historical_candles("5M", candles_5m, server_epoch)
+                if candles_15m:
+                    cm.seed_historical_candles("15M", candles_15m, server_epoch)
+        except Exception as e:
+            logger.error(f"Failed to seed history for {deriv_symbol}: {e}")
+
     deriv_client.start()
 
 def run_outcome_worker():

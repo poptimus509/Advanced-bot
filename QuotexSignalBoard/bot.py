@@ -110,7 +110,7 @@ def send_telegram_alert(pair, direction, score, quality, bias, details_str, time
         }
         response = requests.post(url, json=payload, timeout=10)
         if response.status_code == 200:
-            logger.info(f"Telegram alert successfully sent for {pair} -> {direction}")
+            logger.info(f"SUCCESS: Telegram alert sent for {pair} -> {direction} (Score: {score})")
         else:
             logger.error(f"Failed to send Telegram alert: Status {response.status_code}, Response: {response.text}")
     except Exception as e:
@@ -145,17 +145,21 @@ def on_candle_closed(event: CandleClosedEvent):
 
     logger.info(f"[{display_name}] 1M Strategy Evaluated -> Direction: {direction} | Score: {score}/11 | Quality: {quality}")
 
-    if not signal_lock_manager.acquire_lock(event.symbol, event.timeframe, event.candle_epoch):
-        return
-
-    signal_id = f"{event.symbol}_{event.timeframe}_{event.candle_epoch}"
-    entry_price = event.candle.close
-
-    STRONG_SIGNAL_THRESHOLD = SIGNAL_THRESHOLD_CALL_PUT
+    # FORCE threshold to 8 so high scores (like 9, 10, 11) immediately trigger alerts
+    STRONG_SIGNAL_THRESHOLD = min(SIGNAL_THRESHOLD_CALL_PUT, 8)
 
     if direction in ["CALL", "PUT"] and score >= STRONG_SIGNAL_THRESHOLD:
+        if not signal_lock_manager.acquire_lock(event.symbol, event.timeframe, event.candle_epoch):
+            logger.info(f"Signal lock already acquired for {display_name} at epoch {event.candle_epoch}")
+            return
+
+        signal_id = f"{event.symbol}_{event.timeframe}_{event.candle_epoch}"
+        entry_price = event.candle.close
+
         save_signal_to_db(signal_id, event.symbol, display_name, "1M", event.candle_epoch, direction, score, quality, details["bias"], entry_price)
         signal_lock_manager.commit_result(event.symbol, event.timeframe, event.candle_epoch, direction, {"score": score})
+        
+        logger.info(f"TRIGGERING TELEGRAM & PUSHER for {display_name} with score {score}")
         send_telegram_alert(display_name, direction, score, quality, details["bias"], details["pa"], timeframe="1M")
         
         if pusher_client:
@@ -264,7 +268,6 @@ def api_active_signals():
 
 @app.route("/api/evaluations")
 def api_evaluations():
-    # If evaluations dict is empty, calculate on-the-fly using available history
     results = dict(latest_evaluations)
     if not results:
         tz = pytz.timezone(TIMEZONE_NAME)

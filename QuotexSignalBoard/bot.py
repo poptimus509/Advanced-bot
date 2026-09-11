@@ -35,6 +35,9 @@ app = Flask(__name__)
 
 init_db()
 
+# Global dictionary to store live evaluation scores for all pairs so users can inspect them via API
+latest_evaluations = {}
+
 pusher_client = None
 if PUSHER_ENABLED:
     try:
@@ -120,9 +123,6 @@ def on_candle_closed(event: CandleClosedEvent):
     
     display_name = FOREX_PAIRS.get(event.symbol, event.symbol)
 
-    if not signal_lock_manager.acquire_lock(event.symbol, event.timeframe, event.candle_epoch):
-        return
-
     cm = candle_managers.get(event.symbol)
     if not cm:
         return
@@ -133,7 +133,23 @@ def on_candle_closed(event: CandleClosedEvent):
 
     direction, score, quality, details = evaluate_strategy(df_1m, df_5m, df_15m)
     
+    tz = pytz.timezone(TIMEZONE_NAME)
+    eval_time = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+    # Store latest evaluation for live monitoring via web API
+    latest_evaluations[display_name] = {
+        "timestamp": eval_time,
+        "direction": direction,
+        "score": score,
+        "quality": quality,
+        "bias": details.get("bias", "NEUTRAL"),
+        "details": details.get("pa", "")
+    }
+
     logger.info(f"[{display_name}] 1M Strategy Evaluated -> Direction: {direction} | Score: {score}/11 | Quality: {quality}")
+
+    if not signal_lock_manager.acquire_lock(event.symbol, event.timeframe, event.candle_epoch):
+        return
 
     signal_id = f"{event.symbol}_{event.timeframe}_{event.candle_epoch}"
     entry_price = event.candle.close
@@ -245,6 +261,10 @@ def api_active_signals():
         "direction": r[4], "score": r[5], "quality": r[6], "bias": r[7], "price": r[8]
     } for r in rows]
     return jsonify(signals)
+
+@app.route("/api/evaluations")
+def api_evaluations():
+    return jsonify(latest_evaluations)
 
 @app.route("/api/history")
 def api_history():

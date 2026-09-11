@@ -33,7 +33,6 @@ logger = logging.getLogger("QuotexSignalBoard")
 
 app = Flask(__name__)
 
-# ডাটাবেস ইনিশিয়ালাইজেশন
 init_db()
 
 pusher_client = None
@@ -173,26 +172,17 @@ def run_engine():
                 logger.warning(f"Failed or empty candles for {deriv_symbol}")
             time.sleep(0.2)
             
-        logger.info("=== All pairs seeded successfully. Subscribing to live ticks ===")
-        
-        # ডেরিভ ওয়েবসকেটে লাইভ টিক সাবস্ক্রিপশন রিকোয়েস্ট পাঠানো হচ্ছে
-        for deriv_symbol in FOREX_PAIRS.keys():
-            try:
-                if hasattr(deriv_client, 'subscribe_ticks'):
-                    deriv_client.subscribe_ticks(deriv_symbol)
-                elif hasattr(deriv_client, 'send'):
-                    deriv_client.send({"ticks": deriv_symbol, "subscribe": 1})
-                logger.info(f"Subscribed to live ticks for: {deriv_symbol}")
-            except Exception as sub_err:
-                logger.error(f"Failed to subscribe ticks for {deriv_symbol}: {sub_err}")
-            time.sleep(0.2)
-
-        logger.info("=== Entering live monitoring loop ===")
+        logger.info("=== All pairs seeded successfully. Entering monitoring loop ===")
     except Exception as e:
         logger.error(f"Critical error in run_engine: {e}", exc_info=True)
         
     while True:
-        time.sleep(15)
+        time.sleep(60)
+        for sym, disp in FOREX_PAIRS.items():
+            cm = candle_managers.get(sym)
+            if cm:
+                df_5m = cm.get_closed_history("5M")
+                logger.info(f"MONITOR STATUS -> {disp}: 5M candles available = {len(df_5m)}")
 
 worker_thread = threading.Thread(target=run_engine, daemon=True)
 worker_thread.start()

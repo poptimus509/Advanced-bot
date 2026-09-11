@@ -26,6 +26,7 @@ def init_db():
         bias_15m TEXT,
         entry_reference_price REAL,
         entry_reference_timestamp TEXT,
+        exit_reference_price REAL,
         expiry_timestamp TEXT,
         expiry_price REAL,
         result TEXT,
@@ -36,6 +37,15 @@ def init_db():
         created_at TEXT
     )
     """)
+    
+    # Auto-migration: Check if exit_reference_price column exists, if not add it dynamically
+    try:
+        cursor.execute("PRAGMA table_info(signal_history)")
+        columns = [column["name"] for column in cursor.fetchall()]
+        if "exit_reference_price" not in columns:
+            cursor.execute("ALTER TABLE signal_history ADD COLUMN exit_reference_price REAL")
+    except Exception as e:
+        pass
     
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS telegram_delivery_history (

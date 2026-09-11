@@ -83,6 +83,7 @@ class DerivClient:
         for symbol in self._tick_subscribers.keys():
             sub_req = {"ticks": symbol, "subscribe": 1}
             ws.send(json.dumps(sub_req))
+            logger.info(f"Subscribed to ticks for {symbol}")
 
     def _on_message(self, ws, message):
         local_receipt = time.time()
@@ -104,6 +105,9 @@ class DerivClient:
                 quote = float(tick_data.get("quote", 0.0))
                 epoch = int(tick_data.get("epoch", math.floor(local_receipt)))
                 
+                # টিক রিসিভ হওয়ার লগ যোগ করা হলো
+                logger.info(f"Received live tick -> Symbol: {symbol} | Quote: {quote}")
+
                 if epoch > self.server_epoch:
                     self.server_epoch = epoch
                     self.server_epoch_local_time = local_receipt

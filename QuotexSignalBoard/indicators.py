@@ -1,42 +1,97 @@
 import pandas as pd
 import numpy as np
 
-def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or len(df) < 30:
-        return df
+def calculate_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_macd(series, fast=12, slow=26, signal=9):
+    exp1 = calculate_ema(series, fast)
+    exp2 = calculate_ema(series, slow)
+    macd = exp1 - exp2
+    signal_line = calculate_ema(macd, signal)
+    hist = macd - signal_line
+    return macd, signal_line, hist
+
+def calculate_adx(df, period=14):
+    if df is None or len(df) < period + 1:
+        return pd.Series([0.0] * len(df) if df is not None else [])
     
-    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
-    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
     
-    delta = df["Close"].diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ema_up = up.ewm(com=13, adjust=False).mean()
-    ema_down = down.ewm(com=13, adjust=False).mean()
-    rs = ema_up / ema_down
-    df["RSI"] = 100 - (100 / (1 + rs))
+    plus_dm = high.diff()
+    minus_dm = low.diff()
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
     
-    exp12 = df["Close"].ewm(span=12, adjust=False).mean()
-    exp26 = df["Close"].ewm(span=26, adjust=False).mean()
-    df["MACD"] = exp12 - exp26
-    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_Hist"] = df["MACD"] - df["MACD_Signal"]
-    
-    high_diff = df["High"].diff()
-    low_diff = -df["Low"].diff()
-    df["+DM"] = np.where((high_diff > low_diff) & (high_diff > 0), high_diff, 0.0)
-    df["-DM"] = np.where((low_diff > high_diff) & (low_diff > 0), low_diff, 0.0)
-    
-    tr1 = df["High"] - df["Low"]
-    tr2 = abs(df["High"] - df["Close"].shift(1))
-    tr3 = abs(df["Low"] - df["Close"].shift(1))
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(14).mean()
     
-    atr14 = df["ATR"]
-    plus_di = 100 * (df["+DM"].ewm(alpha=1/14, adjust=False).mean() / atr14)
-    minus_di = 100 * (df["-DM"].ewm(alpha=1/14, adjust=False).mean() / atr14)
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-    df["ADX"] = dx.ewm(alpha=1/14, adjust=False).mean()
+    atr = tr.rolling(window=period).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).rolling(window=period).mean() / atr
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(window=period).mean() / atr
     
-    return df
+    denom = plus_di + minus_di
+    denom = denom.replace(0, np.nan)
+    dx = (100 * (plus_di - minus_di).abs() / denom).abs().fillna(0)
+    adx = dx.rolling(window=period).mean().fillna(0)
+    return adx
+
+def detect_market_structure(df):
+    """Detects Higher High / Higher Low (Bullish) or Lower High / Lower Low (Bearish) and BOS."""
+    if df is None or len(df) < 5:
+        return "NEUTRAL", False
+    
+    recent_highs = df['High'].rolling(window=3).max()
+    recent_lows = df['Low'].rolling(window=3).min()
+    
+    is_hh_hl = (df['High'].iloc[-1] > df['High'].iloc[-3]) and (df['Low'].iloc[-1] > df['Low'].iloc[-3])
+    is_lh_ll = (df['High'].iloc[-1] < df['High'].iloc[-3]) and (df['Low'].iloc[-1] < df['Low'].iloc[-3])
+    
+    bos_bullish = df['Close'].iloc[-1] > recent_highs.iloc[-4] if len(df) >= 4 else False
+    bos_bearish = df['Close'].iloc[-1] < recent_lows.iloc[-4] if len(df) >= 4 else False
+    
+    if is_hh_hl or bos_bullish:
+        return "BULLISH", bool(bos_bullish)
+    elif is_lh_ll or bos_bearish:
+        return "BEARISH", bool(bos_bearish)
+    
+    return "NEUTRAL", False
+
+def detect_candlestick_patterns(df):
+    """Detects Bullish/Bearish Engulfing and Rejection candles."""
+    if df is None or len(df) < 2:
+        return "NONE"
+    
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    curr_body = abs(curr['Close'] - curr['Open'])
+    total_range = curr['High'] - curr['Low']
+    
+    if total_range > 0:
+        upper_wick = curr['High'] - max(curr['Open'], curr['Close'])
+        lower_wick = min(curr['Open'], curr['Close']) - curr['Low']
+        
+        if lower_wick > (2 * curr_body) and upper_wick < curr_body and curr_body > 0:
+            return "BULLISH_REJECTION"
+        if upper_wick > (2 * curr_body) and lower_wick < curr_body and curr_body > 0:
+            return "BEARISH_REJECTION"
+
+    if curr['Close'] > curr['Open'] and prev['Close'] < prev['Open'] and curr['Close'] >= prev['Open'] and curr['Open'] <= prev['Close']:
+        return "BULLISH_ENGULFING"
+    
+    if curr['Close'] < curr['Open'] and prev['Close'] > prev['Open'] and curr['Close'] <= prev['Open'] and curr['Close'] >= prev['Close']:
+        return "BEARISH_ENGULFING"
+        
+    return "NONE"

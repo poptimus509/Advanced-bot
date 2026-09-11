@@ -115,6 +115,7 @@ def on_candle_closed(event: CandleClosedEvent):
         return
     
     display_name = FOREX_PAIRS.get(event.symbol, event.symbol)
+
     if not signal_lock_manager.acquire_lock(event.symbol, event.timeframe, event.candle_epoch):
         return
 
@@ -122,18 +123,20 @@ def on_candle_closed(event: CandleClosedEvent):
     if not cm:
         return
 
-    # Strategy evaluation uses 5M and 15M trend/indicators
     df_5m = cm.get_closed_history("5M")
     df_15m = cm.get_closed_history("15M")
 
     direction, score, quality, details = evaluate_strategy(df_5m, df_15m)
     
-    logger.info(f"[{display_name}] 1M Strategy Evaluated -> Direction: {direction} | Score: {score}/11 | Quality: {quality} | Threshold Required: {SIGNAL_THRESHOLD_CALL_PUT}")
+    logger.info(f"[{display_name}] 1M Strategy Evaluated -> Direction: {direction} | Score: {score}/11 | Quality: {quality}")
 
     signal_id = f"{event.symbol}_{event.timeframe}_{event.candle_epoch}"
     entry_price = event.candle.close
 
-    if direction in ["CALL", "PUT"] and score >= SIGNAL_THRESHOLD_CALL_PUT:
+    # Strict High-Win-Rate Filter: Only allow signals with a score of 8 or higher out of 11
+    STRONG_SIGNAL_THRESHOLD = max(SIGNAL_THRESHOLD_CALL_PUT, 8)
+
+    if direction in ["CALL", "PUT"] and score >= STRONG_SIGNAL_THRESHOLD:
         save_signal_to_db(signal_id, event.symbol, display_name, "1M", event.candle_epoch, direction, score, quality, details["bias"], entry_price)
         signal_lock_manager.commit_result(event.symbol, event.timeframe, event.candle_epoch, direction, {"score": score})
         send_telegram_alert(display_name, direction, score, quality, details["bias"], details["pa"], timeframe="1M")
@@ -156,7 +159,7 @@ def on_candle_closed(event: CandleClosedEvent):
 event_dispatcher.subscribe(on_candle_closed)
 
 def run_engine():
-    logger.info("=== Background engine thread starting (1M Signal Mode) ===")
+    logger.info("=== Background engine thread starting (High-Win-Rate Filtered Mode) ===")
     try:
         deriv_client.start()
         time.sleep(3)
@@ -178,14 +181,14 @@ def run_engine():
                 
             time.sleep(0.2)
             
-        logger.info("=== Seeding complete. Polling 1M candles for signals ===")
+        logger.info("=== Seeding complete. Monitoring for strong signals ===")
     except Exception as e:
         logger.error(f"Critical error in run_engine: {e}", exc_info=True)
         
     last_evaluated_epochs = {sym: 0 for sym in FOREX_PAIRS.keys()}
 
     while True:
-        time.sleep(15)  # Check frequently for 1M candle completion
+        time.sleep(15)
         server_epoch = deriv_client.get_server_epoch()
         
         for sym, disp in FOREX_PAIRS.items():
@@ -194,7 +197,6 @@ def run_engine():
                 if not cm:
                     continue
                 
-                # Fetch fresh 1M, 5M, and 15M data
                 candles_1m = deriv_client.fetch_historical_candles_sync(sym, count=120, granularity=60)
                 if candles_1m:
                     cm.seed_historical_candles("1M", candles_1m, server_epoch)
@@ -235,7 +237,6 @@ def run_engine():
                             closed_history=df_1m
                         )
                         event_dispatcher.dispatch_candle_closed(event)
-                        logger.info(f"Polled & Dispatched 1M closed candle for {disp} at epoch {latest_epoch}")
             except Exception as loop_err:
                 logger.error(f"Error in polling loop for {sym}: {loop_err}")
 

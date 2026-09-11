@@ -196,8 +196,8 @@ def run_engine():
                 if not cm:
                     continue
                 
-                # Periodically fetch latest 5M candles to guarantee candle closure and signal generation
-                candles_5m = deriv_client.fetch_historical_candles_sync(sym, count=10, granularity=300)
+                # Fixed: count increased to 100 to satisfy strategy length check (>= 30)
+                candles_5m = deriv_client.fetch_historical_candles_sync(sym, count=100, granularity=300)
                 if candles_5m:
                     cm.seed_historical_candles("5M", candles_5m, server_epoch)
                     df_5m = cm.get_closed_history("5M")

@@ -56,7 +56,7 @@ deriv_client = DerivClient()
 for deriv_symbol, display_name in FOREX_PAIRS.items():
     cm = CandleManager(symbol=deriv_symbol, event_dispatcher=event_dispatcher)
     candle_managers[deriv_symbol] = cm
-    deriv_client.register_tick_handler(deriv_symbol, cm.process_tick)
+    deriv_client.register_candle_manager(deriv_symbol, cm)
 
 def save_signal_to_db(signal_id, symbol, display_name, timeframe, epoch, direction, score, quality, bias, entry_price):
     tz = pytz.timezone(TIMEZONE_NAME)
@@ -85,19 +85,19 @@ def save_signal_to_db(signal_id, symbol, display_name, timeframe, epoch, directi
         conn.close()
 
 def send_telegram_alert(pair, direction, score, quality, bias, details_str, timeframe="1M"):
-    if not TELEGRAM_ENABLED:
+    if not TELEGRAM_ENABLED or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram alerts are disabled or credentials missing.")
         return
     try:
+        emoji = "🟢" if direction == "CALL" else "🔴"
         message = (
-            f"🚨 *QUOTEX MARKET SIGNAL* 🚨\n\n"
-            f"💱 Pair: *{pair}*\n"
-            f"🟢 Action: *{direction}*\n"
-            f"⏱ Timeframe: *{timeframe}*\n"
-            f"🎯 Score: *{score}/11*\n"
-            f"⭐ Quality: *{quality}*\n"
+            f"{emoji} *QUOTEX MARKET SIGNAL* {emoji}\n\n"
+            f"💱 Pair: *{pair}* ({timeframe})\n"
+            f"🔹 Action: *{direction}*\n"
+            f"🎯 Score: *{score}/11* (Quality: {quality})\n"
             f"📊 15M Bias: *{bias}*\n"
             f"📝 Details: {details_str}\n\n"
-            f"⚠️ Market analysis signal only. No auto-execution."
+            f"⚠️ Market analysis signal. Execute at your own risk."
         )
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
@@ -106,9 +106,13 @@ def send_telegram_alert(pair, direction, score, quality, bias, details_str, time
             "parse_mode": "Markdown",
             "disable_notification": False
         }
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            logger.info(f"Telegram alert successfully sent for {pair} -> {direction}")
+        else:
+            logger.error(f"Failed to send Telegram alert: Status {response.status_code}, Response: {response.text}")
     except Exception as e:
-        logger.error(f"Telegram dispatch error: {e}")
+        logger.error(f"Telegram dispatch error exception: {e}")
 
 def on_candle_closed(event: CandleClosedEvent):
     if event.timeframe != "1M":
@@ -125,16 +129,17 @@ def on_candle_closed(event: CandleClosedEvent):
 
     df_5m = cm.get_closed_history("5M")
     df_15m = cm.get_closed_history("15M")
+    df_1m = cm.get_closed_history("1M")
 
-    direction, score, quality, details = evaluate_strategy(df_5m, df_15m)
+    direction, score, quality, details = evaluate_strategy(df_1m, df_5m, df_15m)
     
     logger.info(f"[{display_name}] 1M Strategy Evaluated -> Direction: {direction} | Score: {score}/11 | Quality: {quality}")
 
     signal_id = f"{event.symbol}_{event.timeframe}_{event.candle_epoch}"
     entry_price = event.candle.close
 
-    # Strict High-Win-Rate Filter: Only allow signals with a score of 8 or higher out of 11
-    STRONG_SIGNAL_THRESHOLD = max(SIGNAL_THRESHOLD_CALL_PUT, 8)
+    # Use config threshold directly so score >= SIGNAL_THRESHOLD_CALL_PUT triggers alerts
+    STRONG_SIGNAL_THRESHOLD = SIGNAL_THRESHOLD_CALL_PUT
 
     if direction in ["CALL", "PUT"] and score >= STRONG_SIGNAL_THRESHOLD:
         save_signal_to_db(signal_id, event.symbol, display_name, "1M", event.candle_epoch, direction, score, quality, details["bias"], entry_price)
@@ -151,142 +156,46 @@ def on_candle_closed(event: CandleClosedEvent):
                     "bias": details["bias"],
                     "timeframe": "1M"
                 })
-            except:
-                pass
-    else:
-        signal_lock_manager.commit_result(event.symbol, event.timeframe, event.candle_epoch, "NO_TRADE")
+            except Exception as e:
+                logger.error(f"Pusher trigger error: {e}")
 
 event_dispatcher.subscribe(on_candle_closed)
 
 def run_engine():
-    logger.info("=== Background engine thread starting (High-Win-Rate Filtered Mode) ===")
-    try:
-        deriv_client.start()
-        time.sleep(3)
-        server_epoch = deriv_client.get_server_epoch()
-        logger.info(f"Server epoch acquired: {server_epoch}")
-        
-        for deriv_symbol in FOREX_PAIRS.keys():
-            candles_1m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=120, granularity=60)
-            if candles_1m and deriv_symbol in candle_managers:
-                candle_managers[deriv_symbol].seed_historical_candles("1M", candles_1m, server_epoch)
-                
-            candles_5m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=100, granularity=300)
-            if candles_5m and deriv_symbol in candle_managers:
-                candle_managers[deriv_symbol].seed_historical_candles("5M", candles_5m, server_epoch)
-                
-            candles_15m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=100, granularity=900)
-            if candles_15m and deriv_symbol in candle_managers:
-                candle_managers[deriv_symbol].seed_historical_candles("15M", candles_15m, server_epoch)
-                
-            time.sleep(0.2)
-            
-        logger.info("=== Seeding complete. Monitoring for strong signals ===")
-    except Exception as e:
-        logger.error(f"Critical error in run_engine: {e}", exc_info=True)
-        
-    last_evaluated_epochs = {sym: 0 for sym in FOREX_PAIRS.keys()}
-
-    while True:
-        time.sleep(15)
-        server_epoch = deriv_client.get_server_epoch()
-        
-        for sym, disp in FOREX_PAIRS.items():
-            try:
-                cm = candle_managers.get(sym)
-                if not cm:
-                    continue
-                
-                candles_1m = deriv_client.fetch_historical_candles_sync(sym, count=120, granularity=60)
-                if candles_1m:
-                    cm.seed_historical_candles("1M", candles_1m, server_epoch)
-                
-                candles_5m = deriv_client.fetch_historical_candles_sync(sym, count=100, granularity=300)
-                if candles_5m:
-                    cm.seed_historical_candles("5M", candles_5m, server_epoch)
-
-                candles_15m = deriv_client.fetch_historical_candles_sync(sym, count=100, granularity=900)
-                if candles_15m:
-                    cm.seed_historical_candles("15M", candles_15m, server_epoch)
-
-                df_1m = cm.get_closed_history("1M")
-                if not df_1m.empty:
-                    latest_row = df_1m.iloc[-1]
-                    latest_epoch = int(latest_row["Time"])
-                    
-                    if latest_epoch > last_evaluated_epochs[sym]:
-                        last_evaluated_epochs[sym] = latest_epoch
-                        candle_obj = Candle(
-                            symbol=sym,
-                            timeframe="1M",
-                            epoch=latest_epoch,
-                            open=float(latest_row["Open"]),
-                            high=float(latest_row["High"]),
-                            low=float(latest_row["Low"]),
-                            close=float(latest_row["Close"]),
-                            is_closed=True,
-                            ticks_count=int(latest_row["TicksCount"]),
-                            close_epoch=latest_epoch + 60
-                        )
-                        event = CandleClosedEvent(
-                            symbol=sym,
-                            timeframe="1M",
-                            candle_epoch=latest_epoch,
-                            candle=candle_obj,
-                            server_time_at_close=server_epoch,
-                            closed_history=df_1m
-                        )
-                        event_dispatcher.dispatch_candle_closed(event)
-            except Exception as loop_err:
-                logger.error(f"Error in polling loop for {sym}: {loop_err}")
-
-worker_thread = threading.Thread(target=run_engine, daemon=True)
-worker_thread.start()
+    logger.info("=== Background engine thread starting (Optimized Multi-Timeframe Strategy) ===")
+    deriv_client.start()
 
 def run_outcome_worker():
     while True:
-        time.sleep(30)
         try:
+            time.sleep(30)
+            tz = pytz.timezone(TIMEZONE_NAME)
+            now = datetime.datetime.now(tz)
             conn = get_db_connection()
             cursor = conn.cursor()
             cursor.execute("SELECT signal_id, symbol, timeframe, candle_epoch, direction, entry_reference_price FROM signal_history WHERE result = 'PENDING'")
-            pending_signals = cursor.fetchall()
-            
-            for sig in pending_signals:
-                sym = sig["symbol"]
-                epoch = sig["candle_epoch"]
-                direction = sig["direction"]
-                entry = sig["entry_reference_price"]
-                
+            rows = cursor.fetchall()
+            for row in rows:
+                sig_id, sym, tf, epoch, direction, entry_price = row
+                if not entry_price:
+                    continue
                 cm = candle_managers.get(sym)
-                if cm:
-                    history_1m = cm.get_closed_history("1M")
-                    target_epoch = epoch
-                    matching = history_1m[history_1m["Time"] >= target_epoch]
-                    if len(matching) >= 2:
-                        expiry_row = matching.iloc[1]
-                        expiry_price = expiry_row["Close"]
-                        
-                        if direction == "CALL":
-                            res = "WIN" if expiry_price > entry else ("LOSS" if expiry_price < entry else "TIE")
-                        else:
-                            res = "WIN" if expiry_price < entry else ("LOSS" if expiry_price > entry else "TIE")
-                        
-                        tz = pytz.timezone(TIMEZONE_NAME)
-                        now = datetime.datetime.now(tz)
-                        
-                        cursor.execute("""
-                        UPDATE signal_history 
-                        SET result = ?, expiry_price = ?, result_timestamp = ?
-                        WHERE signal_id = ?
-                        """, (res, expiry_price, now.isoformat(), sig["signal_id"]))
-                        conn.commit()
+                if not cm:
+                    continue
+                latest_closed = cm.get_latest_closed_candle(tf)
+                if latest_closed and latest_closed.epoch > epoch:
+                    exit_price = latest_closed.close
+                    outcome = "WIN"
+                    if direction == "CALL":
+                        outcome = "WIN" if exit_price > entry_price else ("LOSS" if exit_price < entry_price else "TIE")
+                    elif direction == "PUT":
+                        outcome = "WIN" if exit_price < entry_price else ("LOSS" if exit_price > entry_price else "TIE")
+                    
+                    cursor.execute("UPDATE signal_history SET result = ?, exit_reference_price = ? WHERE signal_id = ?", (outcome, exit_price, sig_id))
+                    conn.commit()
             conn.close()
         except Exception as e:
             logger.error(f"Outcome worker error: {e}")
-
-outcome_thread = threading.Thread(target=run_outcome_worker, daemon=True)
-outcome_thread.start()
 
 @app.route("/")
 def dashboard():
@@ -294,65 +203,58 @@ def dashboard():
 
 @app.route("/health")
 def health():
-    return jsonify({
-        "status": "healthy" if deriv_client.is_connected else "degraded",
-        "websocket_connected": deriv_client.is_connected,
-        "server_epoch": deriv_client.get_server_epoch(),
-        "pairs_tracked": len(FOREX_PAIRS)
-    })
+    return jsonify({"status": "healthy", "time": datetime.datetime.now().isoformat()}), 200
 
 @app.route("/api/dashboard")
 def api_dashboard():
     perf = get_today_performance()
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM signal_history ORDER BY candle_epoch DESC LIMIT 10")
-    history = [dict(row) for row in cursor.fetchall()]
-    conn.close()
     return jsonify({
+        "status": "online",
         "performance": perf,
-        "history": history,
-        "connected": deriv_client.is_connected
+        "active_pairs": list(FOREX_PAIRS.values())
     })
 
-@app.route("/api/signals/active")
+@app.route("/api/active-signals")
 def api_active_signals():
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM signal_history WHERE result = 'PENDING' ORDER BY candle_epoch DESC LIMIT 10")
-    active = [dict(row) for row in cursor.fetchall()]
+    cursor.execute("SELECT signal_id, display_pair, timeframe, signal_timestamp_bdt, direction, score, quality, bias_15m, entry_reference_price FROM signal_history WHERE result = 'PENDING' ORDER BY candle_epoch DESC LIMIT 10")
+    rows = cursor.fetchall()
     conn.close()
-    return jsonify(active)
+    signals = [{
+        "signal_id": r[0], "pair": r[1], "timeframe": r[2], "timestamp": r[3],
+        "direction": r[4], "score": r[5], "quality": r[6], "bias": r[7], "price": r[8]
+    } for r in rows]
+    return jsonify(signals)
 
 @app.route("/api/history")
 def api_history():
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM signal_history ORDER BY candle_epoch DESC LIMIT 50")
-    history = [dict(row) for row in cursor.fetchall()]
+    cursor.execute("SELECT signal_id, display_pair, timeframe, signal_timestamp_bdt, direction, score, quality, bias_15m, entry_reference_price, exit_reference_price, result FROM signal_history ORDER BY candle_epoch DESC LIMIT 50")
+    rows = cursor.fetchall()
     conn.close()
+    history = [{
+        "signal_id": r[0], "pair": r[1], "timeframe": r[2], "timestamp": r[3],
+        "direction": r[4], "score": r[5], "quality": r[6], "bias": r[7],
+        "entry_price": r[8], "exit_price": r[9], "result": r[10]
+    } for r in rows]
     return jsonify(history)
 
 @app.route("/api/performance")
 def api_performance():
-    perf = get_today_performance()
-    return jsonify(perf)
+    return jsonify(get_today_performance())
 
 @app.route("/api/pairs")
 def api_pairs():
-    pairs_data = []
-    for sym, disp in FOREX_PAIRS.items():
-        cm = candle_managers.get(sym)
-        last_c = cm.get_latest_closed_candle("1M") if cm else None
-        price = last_c.close if last_c else 0.0
-        pairs_data.append({
-            "symbol": sym,
-            "display": disp,
-            "price": price,
-            "status": "HEALTHY" if deriv_client.is_connected else "DISCONNECTED"
-        })
-    return jsonify(pairs_data)
+    return jsonify(FOREX_PAIRS)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    engine_thread = threading.Thread(target=run_engine, daemon=True)
+    engine_thread.start()
+    
+    outcome_thread = threading.Thread(target=run_outcome_worker, daemon=True)
+    outcome_thread.start()
+    
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False)

@@ -79,17 +79,23 @@ class DerivClient:
         logger.info("Deriv WebSocket connection established. Synchronizing server time & subscriptions...")
         
         ws.send(json.dumps({"time": 1}))
+        time.sleep(0.5)
 
         for symbol in self._tick_subscribers.keys():
             sub_req = {"ticks": symbol, "subscribe": 1}
             ws.send(json.dumps(sub_req))
-            logger.info(f"Subscribed to ticks for {symbol}")
+            logger.info(f"Sent tick subscription for {symbol}")
+            time.sleep(0.1)
 
     def _on_message(self, ws, message):
         local_receipt = time.time()
         try:
             data = json.loads(message)
             msg_type = data.get("msg_type")
+
+            if msg_type == "error":
+                logger.error(f"Deriv API Error Response: {data.get('error', {}).get('message')}")
+                return
 
             if msg_type == "time":
                 self.server_epoch = int(data.get("time", 0))
@@ -105,7 +111,6 @@ class DerivClient:
                 quote = float(tick_data.get("quote", 0.0))
                 epoch = int(tick_data.get("epoch", math.floor(local_receipt)))
                 
-                # টিক রিসিভ হওয়ার লগ যোগ করা হলো
                 logger.info(f"Received live tick -> Symbol: {symbol} | Quote: {quote}")
 
                 if epoch > self.server_epoch:

@@ -51,8 +51,10 @@ class DerivClient:
         return math.floor(self.server_epoch + elapsed)
 
     def _run_loop(self):
+        logger.info("=== Deriv WebSocket background thread loop started ===")
         while self._is_running:
             try:
+                logger.info(f"Attempting to connect to Deriv WS at {self.ws_url}...")
                 self.ws = websocket.WebSocketApp(
                     self.ws_url,
                     on_open=self._on_open,
@@ -62,7 +64,7 @@ class DerivClient:
                 )
                 self.ws.run_forever(ping_interval=DERIV_PING_INTERVAL_SECONDS, ping_timeout=10)
             except Exception as e:
-                logger.error(f"WebSocket execution fault: {e}")
+                logger.error(f"CRITICAL WebSocket execution fault: {e}", exc_info=True)
 
             if not self._is_running:
                 break

@@ -20,7 +20,7 @@ from config import (
     TIMEZONE_NAME,
     SIGNAL_THRESHOLD_CALL_PUT
 )
-from core.events import EventDispatcher, CandleClosedEvent
+from core.events import EventDispatcher, CandleClosedEvent, Candle
 from core.signal_lock import SignalLockManager
 from data.candle_manager import CandleManager
 from data.deriv_client import DerivClient
@@ -165,17 +165,14 @@ def run_engine():
         for deriv_symbol in FOREX_PAIRS.keys():
             logger.info(f"Fetching historical candles for {deriv_symbol}...")
             
-            # 1M Candles
             candles_1m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=120, granularity=60)
             if candles_1m and deriv_symbol in candle_managers:
                 candle_managers[deriv_symbol].seed_historical_candles("1M", candles_1m, server_epoch)
                 
-            # 5M Candles
             candles_5m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=100, granularity=300)
             if candles_5m and deriv_symbol in candle_managers:
                 candle_managers[deriv_symbol].seed_historical_candles("5M", candles_5m, server_epoch)
                 
-            # 15M Candles
             candles_15m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=100, granularity=900)
             if candles_15m and deriv_symbol in candle_managers:
                 candle_managers[deriv_symbol].seed_historical_candles("15M", candles_15m, server_epoch)
@@ -183,30 +180,57 @@ def run_engine():
             logger.info(f"Successfully seeded 1M, 5M, 15M candles for {deriv_symbol}")
             time.sleep(0.2)
             
-        logger.info("=== All pairs seeded successfully. Subscribing to live ticks ===")
-        
-        for deriv_symbol in FOREX_PAIRS.keys():
-            try:
-                if hasattr(deriv_client, 'subscribe_ticks'):
-                    deriv_client.subscribe_ticks(deriv_symbol)
-                elif hasattr(deriv_client, 'send'):
-                    deriv_client.send({"ticks": deriv_symbol, "subscribe": 1})
-                logger.info(f"Subscribed to live ticks for: {deriv_symbol}")
-            except Exception as sub_err:
-                logger.error(f"Failed to subscribe ticks for {deriv_symbol}: {sub_err}")
-            time.sleep(0.2)
-
-        logger.info("=== Entering live monitoring loop ===")
+        logger.info("=== All pairs seeded successfully. Entering robust polling & monitoring loop ===")
     except Exception as e:
         logger.error(f"Critical error in run_engine: {e}", exc_info=True)
         
+    last_evaluated_epochs = {sym: 0 for sym in FOREX_PAIRS.keys()}
+
     while True:
-        time.sleep(60)
+        time.sleep(30)
+        server_epoch = deriv_client.get_server_epoch()
+        
         for sym, disp in FOREX_PAIRS.items():
-            cm = candle_managers.get(sym)
-            if cm:
-                df_5m = cm.get_closed_history("5M")
-                logger.info(f"MONITOR STATUS -> {disp}: 5M candles available = {len(df_5m)}")
+            try:
+                cm = candle_managers.get(sym)
+                if not cm:
+                    continue
+                
+                # Periodically fetch latest 5M candles to guarantee candle closure and signal generation
+                candles_5m = deriv_client.fetch_historical_candles_sync(sym, count=10, granularity=300)
+                if candles_5m:
+                    cm.seed_historical_candles("5M", candles_5m, server_epoch)
+                    df_5m = cm.get_closed_history("5M")
+                    if not df_5m.empty:
+                        latest_row = df_5m.iloc[-1]
+                        latest_epoch = int(latest_row["Time"])
+                        
+                        if latest_epoch > last_evaluated_epochs[sym]:
+                            last_evaluated_epochs[sym] = latest_epoch
+                            candle_obj = Candle(
+                                symbol=sym,
+                                timeframe="5M",
+                                epoch=latest_epoch,
+                                open=float(latest_row["Open"]),
+                                high=float(latest_row["High"]),
+                                low=float(latest_row["Low"]),
+                                close=float(latest_row["Close"]),
+                                is_closed=True,
+                                ticks_count=int(latest_row["TicksCount"]),
+                                close_epoch=latest_epoch + 300
+                            )
+                            event = CandleClosedEvent(
+                                symbol=sym,
+                                timeframe="5M",
+                                candle_epoch=latest_epoch,
+                                candle=candle_obj,
+                                server_time_at_close=server_epoch,
+                                closed_history=df_5m
+                            )
+                            event_dispatcher.dispatch_candle_closed(event)
+                            logger.info(f"Polled & Dispatched 5M closed candle for {disp} at epoch {latest_epoch}")
+            except Exception as loop_err:
+                logger.error(f"Error in polling loop for {sym}: {loop_err}")
 
 worker_thread = threading.Thread(target=run_engine, daemon=True)
 worker_thread.start()

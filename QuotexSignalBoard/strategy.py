@@ -408,21 +408,22 @@ def evaluate_strategy(df_1m, df_5m, df_15m):
     }
 
     # ========================================================
-    # DATA VALIDATION
+    # DATA VALIDATION & COLUMN NORMALIZATION
     # ========================================================
 
-    if (
-        df_1m is None
-        or df_5m is None
-        or len(df_1m) < 30
-        or len(df_5m) < 30
-    ):
+    if df_1m is None or df_5m is None or len(df_1m) < 30 or len(df_5m) < 30:
         return (
             "NO_TRADE",
             0,
             "INSUFFICIENT_DATA",
             details
         )
+
+    # Convert column names to lowercase to prevent case mismatch issues
+    df_1m.columns = [str(col).lower() for col in df_1m.columns]
+    df_5m.columns = [str(col).lower() for col in df_5m.columns]
+    if df_15m is not None:
+        df_15m.columns = [str(col).lower() for col in df_15m.columns]
 
     required_columns = {
         "open",
@@ -798,7 +799,7 @@ def evaluate_strategy(df_1m, df_5m, df_15m):
 
     elif pa_1m == "BEARISH":
         put_score += 2
-        put_reasons.append("1M bearish price action")
+        call_reasons.append("1M bearish price action")
 
     # ========================================================
     # 5. TIMEFRAME ALIGNMENT

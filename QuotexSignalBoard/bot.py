@@ -128,6 +128,9 @@ def on_candle_closed(event: CandleClosedEvent):
 
     direction, score, quality, details = evaluate_strategy(df_5m, df_15m)
     
+    # ডিবাগ করার জন্য লগ যুক্ত করা হলো যাতে রেন্ডার লগসে স্কোর দেখা যায়
+    logger.info(f"[{display_name}] Strategy Evaluated -> Direction: {direction} | Score: {score}/11 | Quality: {quality} | Threshold Required: {SIGNAL_THRESHOLD_CALL_PUT}")
+
     signal_id = f"{event.symbol}_{event.timeframe}_{event.candle_epoch}"
     entry_price = event.candle.close
 

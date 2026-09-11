@@ -35,7 +35,6 @@ app = Flask(__name__)
 
 init_db()
 
-# Global dictionary to store live evaluation scores for all pairs so users can inspect them via API
 latest_evaluations = {}
 
 pusher_client = None
@@ -122,7 +121,6 @@ def on_candle_closed(event: CandleClosedEvent):
         return
     
     display_name = FOREX_PAIRS.get(event.symbol, event.symbol)
-
     cm = candle_managers.get(event.symbol)
     if not cm:
         return
@@ -136,7 +134,6 @@ def on_candle_closed(event: CandleClosedEvent):
     tz = pytz.timezone(TIMEZONE_NAME)
     eval_time = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
-    # Store latest evaluation for live monitoring via web API
     latest_evaluations[display_name] = {
         "timestamp": eval_time,
         "direction": direction,
@@ -203,8 +200,6 @@ def run_outcome_worker():
     while True:
         try:
             time.sleep(30)
-            tz = pytz.timezone(TIMEZONE_NAME)
-            now = datetime.datetime.now(tz)
             conn = get_db_connection()
             cursor = conn.cursor()
             cursor.execute("SELECT signal_id, symbol, timeframe, candle_epoch, direction, entry_reference_price FROM signal_history WHERE result = 'PENDING'")
@@ -237,13 +232,18 @@ def dashboard():
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "healthy", "time": datetime.datetime.now().isoformat()}), 200
+    return jsonify({
+        "status": "healthy",
+        "deriv_connected": deriv_client.is_connected,
+        "time": datetime.datetime.now().isoformat()
+    }), 200
 
 @app.route("/api/dashboard")
 def api_dashboard():
     perf = get_today_performance()
     return jsonify({
         "status": "online",
+        "deriv_connected": deriv_client.is_connected,
         "performance": perf,
         "active_pairs": list(FOREX_PAIRS.values())
     })
@@ -264,7 +264,28 @@ def api_active_signals():
 
 @app.route("/api/evaluations")
 def api_evaluations():
-    return jsonify(latest_evaluations)
+    # If evaluations dict is empty, calculate on-the-fly using available history
+    results = dict(latest_evaluations)
+    if not results:
+        tz = pytz.timezone(TIMEZONE_NAME)
+        now_str = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+        for sym, disp in FOREX_PAIRS.items():
+            cm = candle_managers.get(sym)
+            if cm:
+                df_1m = cm.get_closed_history("1M")
+                df_5m = cm.get_closed_history("5M")
+                df_15m = cm.get_closed_history("15M")
+                if len(df_1m) > 10:
+                    d, s, q, det = evaluate_strategy(df_1m, df_5m, df_15m)
+                    results[disp] = {
+                        "timestamp": now_str,
+                        "direction": d,
+                        "score": s,
+                        "quality": q,
+                        "bias": det.get("bias", "NEUTRAL"),
+                        "details": det.get("pa", "")
+                    }
+    return jsonify(results)
 
 @app.route("/api/history")
 def api_history():
@@ -288,7 +309,6 @@ def api_performance():
 def api_pairs():
     return jsonify(FOREX_PAIRS)
 
-# Lazy initialization for Gunicorn/Render worker process compatibility
 _threads_started = False
 _threads_lock = threading.Lock()
 

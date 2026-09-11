@@ -36,7 +36,7 @@ app = Flask(__name__)
 init_db()
 
 latest_evaluations = {}
-sent_telegram_cache = set()  # To prevent duplicate telegram alerts for the same signal
+sent_telegram_cache = set()
 
 pusher_client = None
 if PUSHER_ENABLED:
@@ -118,8 +118,8 @@ def send_telegram_alert(pair, direction, score, quality, bias, details_str, time
         logger.error(f"Telegram dispatch error exception: {e}")
 
 def process_signal_if_strong(symbol, display_name, timeframe, direction, score, quality, details, entry_price, epoch):
-    # Threshold set to 6 as requested
-    STRONG_SIGNAL_THRESHOLD = 6
+    # Threshold set to 7 as requested
+    STRONG_SIGNAL_THRESHOLD = 7
     if direction in ["CALL", "PUT"] and score >= STRONG_SIGNAL_THRESHOLD:
         sig_key = f"{symbol}_{epoch}_{direction}"
         if sig_key in sent_telegram_cache:
@@ -144,38 +144,57 @@ def process_signal_if_strong(symbol, display_name, timeframe, direction, score, 
             except Exception as e:
                 logger.error(f"Pusher trigger error: {e}")
 
+def evaluate_and_dispatch_all():
+    tz = pytz.timezone(TIMEZONE_NAME)
+    now_str = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+    current_epoch = int(time.time() // 60) * 60
+
+    for sym, disp in FOREX_PAIRS.items():
+        cm = candle_managers.get(sym)
+        if cm:
+            df_1m = cm.get_closed_history("1M")
+            df_5m = cm.get_closed_history("5M")
+            df_15m = cm.get_closed_history("15M")
+            if len(df_1m) > 10:
+                d, s, q, det = evaluate_strategy(df_1m, df_5m, df_15m)
+                
+                latest_evaluations[disp] = {
+                    "timestamp": now_str,
+                    "direction": d,
+                    "score": s,
+                    "quality": q,
+                    "bias": det.get("bias", "NEUTRAL"),
+                    "details": det.get("pa", "")
+                }
+                
+                latest_closed = cm.get_latest_closed_candle("1M")
+                entry_price = latest_closed.close if latest_closed else 0.0
+                epoch_val = latest_closed.epoch if latest_closed else current_epoch
+                
+                process_signal_if_strong(sym, disp, "1M", d, s, q, det, entry_price, epoch_val)
+
 def on_candle_closed(event: CandleClosedEvent):
     if event.timeframe != "1M":
         return
-    
-    display_name = FOREX_PAIRS.get(event.symbol, event.symbol)
-    cm = candle_managers.get(event.symbol)
-    if not cm:
-        return
-
-    df_5m = cm.get_closed_history("5M")
-    df_15m = cm.get_closed_history("15M")
-    df_1m = cm.get_closed_history("1M")
-
-    direction, score, quality, details = evaluate_strategy(df_1m, df_5m, df_15m)
-    
-    tz = pytz.timezone(TIMEZONE_NAME)
-    eval_time = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-
-    latest_evaluations[display_name] = {
-        "timestamp": eval_time,
-        "direction": direction,
-        "score": score,
-        "quality": quality,
-        "bias": details.get("bias", "NEUTRAL"),
-        "details": details.get("pa", "")
-    }
-
-    logger.info(f"[{display_name}] 1M Strategy Evaluated -> Direction: {direction} | Score: {score}/11 | Quality: {quality}")
-
-    process_signal_if_strong(event.symbol, display_name, "1M", direction, score, quality, details, event.candle.close, event.candle_epoch)
+    evaluate_and_dispatch_all()
 
 event_dispatcher.subscribe(on_candle_closed)
+
+def run_fast_minute_checker():
+    """Runs every second to trigger evaluation right at the beginning of every minute (0th second)"""
+    last_checked_min = -1
+    while True:
+        try:
+            current_min = datetime.datetime.now().minute
+            if current_min != last_checked_min:
+                # Wait 1 second into the new minute to ensure candles are updated
+                time.sleep(1)
+                evaluate_and_dispatch_all()
+                last_checked_min = current_min
+            time.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Fast minute checker error: {e}")
+            time.sleep(5)
 
 def run_engine():
     logger.info("=== Background engine thread starting (Optimized Multi-Timeframe Strategy) ===")
@@ -268,36 +287,8 @@ def api_active_signals():
 
 @app.route("/api/evaluations")
 def api_evaluations():
-    results = {}
-    tz = pytz.timezone(TIMEZONE_NAME)
-    now_str = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-    current_epoch = int(time.time() // 60) * 60
-
-    for sym, disp in FOREX_PAIRS.items():
-        cm = candle_managers.get(sym)
-        if cm:
-            df_1m = cm.get_closed_history("1M")
-            df_5m = cm.get_closed_history("5M")
-            df_15m = cm.get_closed_history("15M")
-            if len(df_1m) > 10:
-                d, s, q, det = evaluate_strategy(df_1m, df_5m, df_15m)
-                
-                results[disp] = {
-                    "timestamp": now_str,
-                    "direction": d,
-                    "score": s,
-                    "quality": q,
-                    "bias": det.get("bias", "NEUTRAL"),
-                    "details": det.get("pa", "")
-                }
-                
-                latest_closed = cm.get_latest_closed_candle("1M")
-                entry_price = latest_closed.close if latest_closed else 0.0
-                epoch_val = latest_closed.epoch if latest_closed else current_epoch
-                
-                process_signal_if_strong(sym, disp, "1M", d, s, q, det, entry_price, epoch_val)
-
-    return jsonify(results)
+    evaluate_and_dispatch_all()
+    return jsonify(latest_evaluations)
 
 @app.route("/api/history")
 def api_history():
@@ -334,7 +325,12 @@ def start_background_threads_once():
                 
                 outcome_thread = threading.Thread(target=run_outcome_worker, daemon=True)
                 outcome_thread.start()
-                logger.info("Background engine & outcome worker threads successfully initialized in worker process.")
+
+                # Fast minute checker to send signals right at the start of the candle
+                fast_checker_thread = threading.Thread(target=run_fast_minute_checker, daemon=True)
+                fast_checker_thread.start()
+
+                logger.info("Background engine, outcome worker & fast minute checker threads successfully initialized.")
                 _threads_started = True
             except Exception as e:
                 logger.error(f"Failed to initialize background threads: {e}")

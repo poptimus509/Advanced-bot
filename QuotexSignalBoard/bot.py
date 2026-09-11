@@ -118,7 +118,8 @@ def send_telegram_alert(pair, direction, score, quality, bias, details_str, time
         logger.error(f"Telegram dispatch error exception: {e}")
 
 def process_signal_if_strong(symbol, display_name, timeframe, direction, score, quality, details, entry_price, epoch):
-    STRONG_SIGNAL_THRESHOLD = 8
+    # Threshold set to 6 as requested
+    STRONG_SIGNAL_THRESHOLD = 6
     if direction in ["CALL", "PUT"] and score >= STRONG_SIGNAL_THRESHOLD:
         sig_key = f"{symbol}_{epoch}_{direction}"
         if sig_key in sent_telegram_cache:
@@ -290,7 +291,6 @@ def api_evaluations():
                     "details": det.get("pa", "")
                 }
                 
-                # Direct trigger check: if evaluation finds high score, dispatch telegram immediately!
                 latest_closed = cm.get_latest_closed_candle("1M")
                 entry_price = latest_closed.close if latest_closed else 0.0
                 epoch_val = latest_closed.epoch if latest_closed else current_epoch

@@ -36,6 +36,7 @@ app = Flask(__name__)
 init_db()
 
 latest_evaluations = {}
+sent_telegram_cache = set()  # To prevent duplicate telegram alerts for the same signal
 
 pusher_client = None
 if PUSHER_ENABLED:
@@ -116,6 +117,32 @@ def send_telegram_alert(pair, direction, score, quality, bias, details_str, time
     except Exception as e:
         logger.error(f"Telegram dispatch error exception: {e}")
 
+def process_signal_if_strong(symbol, display_name, timeframe, direction, score, quality, details, entry_price, epoch):
+    STRONG_SIGNAL_THRESHOLD = 8
+    if direction in ["CALL", "PUT"] and score >= STRONG_SIGNAL_THRESHOLD:
+        sig_key = f"{symbol}_{epoch}_{direction}"
+        if sig_key in sent_telegram_cache:
+            return
+        
+        sent_telegram_cache.add(sig_key)
+        signal_id = f"{symbol}_{timeframe}_{epoch}"
+        
+        save_signal_to_db(signal_id, symbol, display_name, timeframe, epoch, direction, score, quality, details.get("bias", "NEUTRAL"), entry_price)
+        send_telegram_alert(display_name, direction, score, quality, details.get("bias", "NEUTRAL"), details.get("pa", ""), timeframe=timeframe)
+        
+        if pusher_client:
+            try:
+                pusher_client.trigger("trading-signals", "new-signal", {
+                    "pair": display_name,
+                    "direction": direction,
+                    "score": score,
+                    "quality": quality,
+                    "bias": details.get("bias", "NEUTRAL"),
+                    "timeframe": timeframe
+                })
+            except Exception as e:
+                logger.error(f"Pusher trigger error: {e}")
+
 def on_candle_closed(event: CandleClosedEvent):
     if event.timeframe != "1M":
         return
@@ -145,35 +172,7 @@ def on_candle_closed(event: CandleClosedEvent):
 
     logger.info(f"[{display_name}] 1M Strategy Evaluated -> Direction: {direction} | Score: {score}/11 | Quality: {quality}")
 
-    # FORCE threshold to 8 so high scores (like 9, 10, 11) immediately trigger alerts
-    STRONG_SIGNAL_THRESHOLD = min(SIGNAL_THRESHOLD_CALL_PUT, 8)
-
-    if direction in ["CALL", "PUT"] and score >= STRONG_SIGNAL_THRESHOLD:
-        if not signal_lock_manager.acquire_lock(event.symbol, event.timeframe, event.candle_epoch):
-            logger.info(f"Signal lock already acquired for {display_name} at epoch {event.candle_epoch}")
-            return
-
-        signal_id = f"{event.symbol}_{event.timeframe}_{event.candle_epoch}"
-        entry_price = event.candle.close
-
-        save_signal_to_db(signal_id, event.symbol, display_name, "1M", event.candle_epoch, direction, score, quality, details["bias"], entry_price)
-        signal_lock_manager.commit_result(event.symbol, event.timeframe, event.candle_epoch, direction, {"score": score})
-        
-        logger.info(f"TRIGGERING TELEGRAM & PUSHER for {display_name} with score {score}")
-        send_telegram_alert(display_name, direction, score, quality, details["bias"], details["pa"], timeframe="1M")
-        
-        if pusher_client:
-            try:
-                pusher_client.trigger("trading-signals", "new-signal", {
-                    "pair": display_name,
-                    "direction": direction,
-                    "score": score,
-                    "quality": quality,
-                    "bias": details["bias"],
-                    "timeframe": "1M"
-                })
-            except Exception as e:
-                logger.error(f"Pusher trigger error: {e}")
+    process_signal_if_strong(event.symbol, display_name, "1M", direction, score, quality, details, event.candle.close, event.candle_epoch)
 
 event_dispatcher.subscribe(on_candle_closed)
 
@@ -268,26 +267,36 @@ def api_active_signals():
 
 @app.route("/api/evaluations")
 def api_evaluations():
-    results = dict(latest_evaluations)
-    if not results:
-        tz = pytz.timezone(TIMEZONE_NAME)
-        now_str = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-        for sym, disp in FOREX_PAIRS.items():
-            cm = candle_managers.get(sym)
-            if cm:
-                df_1m = cm.get_closed_history("1M")
-                df_5m = cm.get_closed_history("5M")
-                df_15m = cm.get_closed_history("15M")
-                if len(df_1m) > 10:
-                    d, s, q, det = evaluate_strategy(df_1m, df_5m, df_15m)
-                    results[disp] = {
-                        "timestamp": now_str,
-                        "direction": d,
-                        "score": s,
-                        "quality": q,
-                        "bias": det.get("bias", "NEUTRAL"),
-                        "details": det.get("pa", "")
-                    }
+    results = {}
+    tz = pytz.timezone(TIMEZONE_NAME)
+    now_str = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+    current_epoch = int(time.time() // 60) * 60
+
+    for sym, disp in FOREX_PAIRS.items():
+        cm = candle_managers.get(sym)
+        if cm:
+            df_1m = cm.get_closed_history("1M")
+            df_5m = cm.get_closed_history("5M")
+            df_15m = cm.get_closed_history("15M")
+            if len(df_1m) > 10:
+                d, s, q, det = evaluate_strategy(df_1m, df_5m, df_15m)
+                
+                results[disp] = {
+                    "timestamp": now_str,
+                    "direction": d,
+                    "score": s,
+                    "quality": q,
+                    "bias": det.get("bias", "NEUTRAL"),
+                    "details": det.get("pa", "")
+                }
+                
+                # Direct trigger check: if evaluation finds high score, dispatch telegram immediately!
+                latest_closed = cm.get_latest_closed_candle("1M")
+                entry_price = latest_closed.close if latest_closed else 0.0
+                epoch_val = latest_closed.epoch if latest_closed else current_epoch
+                
+                process_signal_if_strong(sym, disp, "1M", d, s, q, det, entry_price, epoch_val)
+
     return jsonify(results)
 
 @app.route("/api/history")

@@ -164,15 +164,39 @@ def run_engine():
         
         for deriv_symbol in FOREX_PAIRS.keys():
             logger.info(f"Fetching historical candles for {deriv_symbol}...")
-            candles = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=120, granularity=60)
-            if candles and deriv_symbol in candle_managers:
-                candle_managers[deriv_symbol].seed_historical_candles("1M", candles, server_epoch)
-                logger.info(f"Seeded candles for {deriv_symbol}")
-            else:
-                logger.warning(f"Failed or empty candles for {deriv_symbol}")
+            
+            # 1M Candles
+            candles_1m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=120, granularity=60)
+            if candles_1m and deriv_symbol in candle_managers:
+                candle_managers[deriv_symbol].seed_historical_candles("1M", candles_1m, server_epoch)
+                
+            # 5M Candles
+            candles_5m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=100, granularity=300)
+            if candles_5m and deriv_symbol in candle_managers:
+                candle_managers[deriv_symbol].seed_historical_candles("5M", candles_5m, server_epoch)
+                
+            # 15M Candles
+            candles_15m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=100, granularity=900)
+            if candles_15m and deriv_symbol in candle_managers:
+                candle_managers[deriv_symbol].seed_historical_candles("15M", candles_15m, server_epoch)
+                
+            logger.info(f"Successfully seeded 1M, 5M, 15M candles for {deriv_symbol}")
             time.sleep(0.2)
             
-        logger.info("=== All pairs seeded successfully. Entering monitoring loop ===")
+        logger.info("=== All pairs seeded successfully. Subscribing to live ticks ===")
+        
+        for deriv_symbol in FOREX_PAIRS.keys():
+            try:
+                if hasattr(deriv_client, 'subscribe_ticks'):
+                    deriv_client.subscribe_ticks(deriv_symbol)
+                elif hasattr(deriv_client, 'send'):
+                    deriv_client.send({"ticks": deriv_symbol, "subscribe": 1})
+                logger.info(f"Subscribed to live ticks for: {deriv_symbol}")
+            except Exception as sub_err:
+                logger.error(f"Failed to subscribe ticks for {deriv_symbol}: {sub_err}")
+            time.sleep(0.2)
+
+        logger.info("=== Entering live monitoring loop ===")
     except Exception as e:
         logger.error(f"Critical error in run_engine: {e}", exc_info=True)
         

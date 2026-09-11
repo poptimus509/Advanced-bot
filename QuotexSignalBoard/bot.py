@@ -161,7 +161,7 @@ def on_candle_closed(event: CandleClosedEvent):
 event_dispatcher.subscribe(on_candle_closed)
 
 def run_engine():
-    logger.info("=== Background engine thread starting (Optimized Multi-Timeframe Strategy) ==Pclass ===")
+    logger.info("=== Background engine thread starting (Optimized Multi-Timeframe Strategy) ===")
     
     server_epoch = deriv_client.get_server_epoch()
     for deriv_symbol in FOREX_PAIRS.keys():

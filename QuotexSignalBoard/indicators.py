@@ -95,3 +95,19 @@ def detect_candlestick_patterns(df):
         return "BEARISH_ENGULFING"
         
     return "NONE"
+
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Backward compatibility wrapper for legacy code expecting calculate_indicators."""
+    if df is None or df.empty or len(df) < 10:
+        return df
+    
+    df = df.copy()
+    df["EMA20"] = calculate_ema(df["Close"], 20)
+    df["EMA50"] = calculate_ema(df["Close"], 50)
+    df["RSI"] = calculate_rsi(df["Close"], 14)
+    macd, signal, hist = calculate_macd(df["Close"])
+    df["MACD"] = macd
+    df["MACD_Signal"] = signal
+    df["MACD_Hist"] = hist
+    df["ADX"] = calculate_adx(df, 14)
+    return df

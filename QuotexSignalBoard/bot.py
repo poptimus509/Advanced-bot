@@ -906,11 +906,12 @@ def run_scan_worker():
                     for manager in candle_managers.values()
                 ]
 
-                histories_ready = all(
-                    candle is not None
-                    and int(candle.close_epoch) == minute
-                    for candle in latest_candles
+                # Flexible check: allow scan if at least a majority of candles are ready
+                valid_candles_count = sum(
+                    1 for candle in latest_candles 
+                    if candle is not None and abs(int(candle.close_epoch) - minute) <= 60
                 )
+                histories_ready = valid_candles_count >= int(len(candle_managers) * 0.75)
 
             grace_deadline = min(
                 cfg.SCAN_DELAY_SECONDS + 4,

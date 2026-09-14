@@ -338,7 +338,6 @@ def history_snapshot(symbol):
 
         return float(window["count"])
 
-    # Historical tickscount is not treated as real traded volume.
     df["verified_ticks"] = df["time"].map(verified_count)
 
     return df
@@ -451,7 +450,6 @@ def send_telegram_alert(candidate, target_epoch):
         return "REJECTED"
 
     except requests.RequestException as exc:
-        # Do not log request URLs containing the bot token.
         logger.error(
             "Telegram delivery uncertain: %s",
             type(exc).__name__,
@@ -543,7 +541,6 @@ def dispatch_best_signal(candidate, target_epoch):
     if drift > max_drift:
         return "PRICE_MOVED_FROM_SETUP"
 
-    # Validate configuration before reserving a setup.
     if not cfg.TELEGRAM_ENABLED:
         return "DISABLED"
 
@@ -563,7 +560,6 @@ def dispatch_best_signal(candidate, target_epoch):
     status = send_telegram_alert(candidate, target_epoch)
     set_dispatch_status(target_epoch, status)
 
-    # UNKNOWN attempts remain reserved to avoid duplicate sends.
     if status != "SENT":
         return status
 
@@ -751,7 +747,6 @@ def evaluate_and_dispatch_all(target_epoch):
                     candidate["display_name"]
                 ]["delivery"] = status
 
-                # Only a pre-send quote failure allows the next candidate.
                 if status not in (
                     "NO_FRESH_QUOTE",
                     "PRICE_MOVED_FROM_SETUP",
@@ -852,7 +847,6 @@ def run_history_worker():
             now = deriv_client.get_server_time()
             minute = int(now // 60) * 60
 
-            # Refresh away from the entry scan.
             if (
                 15 <= now % 60 < 25
                 and minute != last_minute
@@ -971,17 +965,13 @@ def run_scan_worker():
 
 def run_engine():
     try:
-        # Establish live connectivity without waiting for history downloads.
         deriv_client.start()
-
         resync_historical_candles()
-
         ready.set()
         logger.info(
             "Data engine initialized. "
             "Fresh ticks and closed history are still required for signals."
         )
-
     except Exception:
         logger.exception("Data engine failed to start.")
 
@@ -1032,7 +1022,6 @@ def run_outcome_worker():
                 if df.empty or "time" not in df.columns:
                     continue
 
-                # Exact expiry candle only.
                 match = df[df["time"] == int(target)]
 
                 if match.empty:

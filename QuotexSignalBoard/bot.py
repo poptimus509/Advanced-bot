@@ -11,11 +11,17 @@ import requests
 
 from config import (
     FOREX_PAIRS,
+    ALLOW_NEXT_PAIR_DURING_COOLDOWN,
+    MIN_15M_HISTORY,
+    MIN_1M_HISTORY,
+    MIN_5M_HISTORY,
     PUSHER_APP_ID,
     PUSHER_CLUSTER,
     PUSHER_ENABLED,
     PUSHER_KEY,
     PUSHER_SECRET,
+    SAME_PAIR_COOLDOWN_MINUTES,
+    SIGNALS_ENABLED,
     SIGNAL_THRESHOLD_CALL_PUT,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
@@ -55,6 +61,7 @@ latest_evaluations = {}
 sent_telegram_cache = set()
 target_signal_cache = set()
 processed_target_minutes = set()
+pair_last_signal_epoch = {}
 
 evaluation_lock = threading.Lock()
 cache_lock = threading.Lock()
@@ -231,15 +238,16 @@ def dispatch_best_signal(candidate, target_epoch):
         target_signal_cache.add(target_key)
         sent_telegram_cache.add(signal_key)
         processed_target_minutes.add(target_epoch)
+        pair_last_signal_epoch[symbol] = target_epoch
 
     signal_id = f"{symbol}_{timeframe}_{target_epoch}"
     bias = details.get("bias", "NEUTRAL")
-    pa = details.get("pa", "")
+    explanation = details.get("score_reason") or details.get("pa", "")
 
     # Non-blocking Telegram notification
     threading.Thread(
         target=send_telegram_alert,
-        args=(display_name, direction, score, quality, bias, pa, timeframe, target_epoch),
+        args=(display_name, direction, score, quality, bias, explanation, timeframe, target_epoch),
         daemon=True
     ).start()
 
@@ -282,9 +290,11 @@ def evaluate_pair(symbol, display_name, target_epoch):
         df_5m = cm.get_closed_history("5M")
         df_15m = cm.get_closed_history("15M")
 
-        if df_1m is None or len(df_1m) < 25:
+        if df_1m is None or len(df_1m) < MIN_1M_HISTORY:
             return None
-        if df_5m is None or len(df_5m) < 20:
+        if df_5m is None or len(df_5m) < MIN_5M_HISTORY:
+            return None
+        if df_15m is None or len(df_15m) < MIN_15M_HISTORY:
             return None
 
         direction, score, quality, details = evaluate_strategy(
@@ -295,6 +305,16 @@ def evaluate_pair(symbol, display_name, target_epoch):
 
         latest_closed = cm.get_latest_closed_candle("1M")
         if not latest_closed:
+            return None
+
+        # At second 58 of the current minute, the most recent closed candle
+        # must have closed exactly at the start of that minute.
+        expected_close_epoch = int(target_epoch) - 60
+        if int(latest_closed.close_epoch) != expected_close_epoch:
+            logger.warning(
+                "Skipping %s: stale 1M candle (close=%s, expected=%s)",
+                display_name, latest_closed.close_epoch, expected_close_epoch
+            )
             return None
 
         entry_price = float(latest_closed.close)
@@ -346,20 +366,65 @@ def evaluate_and_dispatch_all(send_signal=True, target_epoch=None):
                 "quality": quality,
                 "bias": details.get("bias", "NEUTRAL"),
                 "details": details.get("pa", ""),
+                "score_reason": details.get("score_reason", ""),
+                "call_score": details.get("call_score", 0),
+                "put_score": details.get("put_score", 0),
+                "alignment_score": details.get("alignment_score", 0),
+                "adx_5m": details.get("adx_5m", 0.0),
                 "analysis_candle_epoch": target_epoch - 60,
                 "target_candle_epoch": target_epoch
             }
 
             # Enforce 8/10 minimum score and filter non-trade outputs
-            if send_signal and direction in ("CALL", "PUT") and score >= 8:
+            if send_signal and SIGNALS_ENABLED and direction in ("CALL", "PUT") and score >= SIGNAL_THRESHOLD_CALL_PUT:
                 eligible_candidates.append(result)
 
         if not send_signal or not eligible_candidates:
             return
 
-        # Sort by score descending to pick the absolute highest quality setup
-        eligible_candidates.sort(key=lambda x: x["score"], reverse=True)
-        best_candidate = eligible_candidates[0]
+        # Score remains primary. Alignment, ADX, EMA separation and MACD
+        # acceleration provide deterministic market-strength tie-breaks.
+        eligible_candidates.sort(
+            key=lambda x: (
+                x["score"],
+                x["details"].get("alignment_score", 0),
+                x["details"].get("adx_5m", 0.0),
+                x["details"].get("ema_spread_pct", 0.0),
+                x["details"].get("momentum_strength", 0.0),
+            ),
+            reverse=True,
+        )
+
+        cooldown_seconds = SAME_PAIR_COOLDOWN_MINUTES * 60
+        if ALLOW_NEXT_PAIR_DURING_COOLDOWN:
+            ranked_pool = [
+                candidate for candidate in eligible_candidates
+                if target_epoch - pair_last_signal_epoch.get(candidate["symbol"], 0) >= cooldown_seconds
+            ]
+        else:
+            strongest = eligible_candidates[0]
+            last_epoch = pair_last_signal_epoch.get(strongest["symbol"], 0)
+            ranked_pool = [strongest] if target_epoch - last_epoch >= cooldown_seconds else []
+
+        if not ranked_pool:
+            logger.info("Eligible setup(s) found, but cooldown blocked dispatch.")
+            return
+
+        best_candidate = ranked_pool[0]
+
+        logger.info(
+            "Candidate ranking: %s",
+            [
+                {
+                    "pair": item["display_name"],
+                    "direction": item["direction"],
+                    "score": item["score"],
+                    "alignment": item["details"].get("alignment_score", 0),
+                    "adx": item["details"].get("adx_5m", 0.0),
+                }
+                for item in ranked_pool
+            ],
+        )
 
         dispatch_best_signal(best_candidate, target_epoch)
 

@@ -472,7 +472,9 @@ def run_engine():
         for deriv_symbol in FOREX_PAIRS.keys():
             try:
                 candles_1m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=120, granularity=60)
-                candles_5m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=60, granularity=300)
+                # Request more than the minimum because Deriv may include the
+                # currently forming candle, which CandleManager correctly drops.
+                candles_5m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=100, granularity=300)
                 candles_15m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=40, granularity=900)
 
                 if deriv_symbol not in candle_managers:
@@ -482,6 +484,14 @@ def run_engine():
                 if candles_1m: cm.seed_historical_candles("1M", candles_1m, server_epoch)
                 if candles_5m: cm.seed_historical_candles("5M", candles_5m, server_epoch)
                 if candles_15m: cm.seed_historical_candles("15M", candles_15m, server_epoch)
+
+                logger.info(
+                    "Seeded %s histories: 1M=%s, 5M=%s, 15M=%s",
+                    deriv_symbol,
+                    len(cm.get_closed_history("1M")),
+                    len(cm.get_closed_history("5M")),
+                    len(cm.get_closed_history("15M")),
+                )
             except Exception as e:
                 logger.error(f"History seeding error for {deriv_symbol}: {e}")
 

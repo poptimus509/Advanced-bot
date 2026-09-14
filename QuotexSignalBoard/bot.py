@@ -467,36 +467,82 @@ def run_precision_sniper():
 # ENGINE & WORKERS INITIALIZATION
 # ============================================================
 
+history_resync_lock = threading.Lock()
+
+def resync_historical_candles(include_higher_timeframes=True):
+    """Refresh closed candles even when Render's live tick stream stalls."""
+    if not history_resync_lock.acquire(blocking=False):
+        return
+
+    try:
+        requests_list = []
+        for symbol in FOREX_PAIRS.keys():
+            requests_list.append({
+                "key": f"{symbol}:1M", "symbol": symbol,
+                "count": 120, "granularity": 60,
+            })
+            if include_higher_timeframes:
+                requests_list.extend([
+                    {
+                        "key": f"{symbol}:5M", "symbol": symbol,
+                        "count": 100, "granularity": 300,
+                    },
+                    {
+                        "key": f"{symbol}:15M", "symbol": symbol,
+                        "count": 40, "granularity": 900,
+                    },
+                ])
+
+        histories = deriv_client.fetch_historical_candles_batch_sync(requests_list)
+        server_epoch = deriv_client.fetch_server_epoch_sync()
+
+        updated = 0
+        for symbol, cm in candle_managers.items():
+            candles_1m = histories.get(f"{symbol}:1M", [])
+            if candles_1m:
+                cm.seed_historical_candles("1M", candles_1m, server_epoch)
+                updated += 1
+
+            if include_higher_timeframes:
+                candles_5m = histories.get(f"{symbol}:5M", [])
+                candles_15m = histories.get(f"{symbol}:15M", [])
+                if candles_5m:
+                    cm.seed_historical_candles("5M", candles_5m, server_epoch)
+                if candles_15m:
+                    cm.seed_historical_candles("15M", candles_15m, server_epoch)
+
+        logger.info(
+            "Historical resync completed: 1M updated for %s/%s pairs; higher=%s",
+            updated, len(FOREX_PAIRS), include_higher_timeframes,
+        )
+    except Exception as e:
+        logger.error(f"Historical resync error: {e}")
+    finally:
+        history_resync_lock.release()
+
+def run_history_resync_worker():
+    """Refresh 1M every minute and 5M/15M every five minutes."""
+    last_resynced_minute = None
+    while True:
+        try:
+            now = deriv_client.get_server_time()
+            minute_epoch = int(now // 60) * 60
+            second = now % 60
+
+            if 3 <= second < 10 and minute_epoch != last_resynced_minute:
+                last_resynced_minute = minute_epoch
+                include_higher = (minute_epoch // 60) % 5 == 0
+                resync_historical_candles(include_higher_timeframes=include_higher)
+
+            time.sleep(0.25)
+        except Exception as e:
+            logger.error(f"History resync worker error: {e}")
+            time.sleep(1)
+
 def run_engine():
     logger.info("=== Starting live Deriv engine ===")
     try:
-        server_epoch = deriv_client.get_server_epoch()
-        for deriv_symbol in FOREX_PAIRS.keys():
-            try:
-                candles_1m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=120, granularity=60)
-                # Request more than the minimum because Deriv may include the
-                # currently forming candle, which CandleManager correctly drops.
-                candles_5m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=100, granularity=300)
-                candles_15m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=40, granularity=900)
-
-                if deriv_symbol not in candle_managers:
-                    continue
-
-                cm = candle_managers[deriv_symbol]
-                if candles_1m: cm.seed_historical_candles("1M", candles_1m, server_epoch)
-                if candles_5m: cm.seed_historical_candles("5M", candles_5m, server_epoch)
-                if candles_15m: cm.seed_historical_candles("15M", candles_15m, server_epoch)
-
-                logger.info(
-                    "Seeded %s histories: 1M=%s, 5M=%s, 15M=%s",
-                    deriv_symbol,
-                    len(cm.get_closed_history("1M")),
-                    len(cm.get_closed_history("5M")),
-                    len(cm.get_closed_history("15M")),
-                )
-            except Exception as e:
-                logger.error(f"History seeding error for {deriv_symbol}: {e}")
-
+        resync_historical_candles(include_higher_timeframes=True)
         deriv_client.start()
         logger.info("Deriv live engine started successfully.")
     except Exception as e:
@@ -560,6 +606,7 @@ def start_background_threads_once():
             threading.Thread(target=run_engine, daemon=True, name="DerivEngine").start()
             threading.Thread(target=run_outcome_worker, daemon=True, name="OutcomeWorker").start()
             threading.Thread(target=run_precision_sniper, daemon=True, name="PrecisionSniper").start()
+            threading.Thread(target=run_history_resync_worker, daemon=True, name="HistoryResync").start()
             _threads_started = True
             logger.info("Zero-latency background engines running.")
         except Exception as e:

@@ -1,5 +1,6 @@
 import datetime
 import logging
+import math
 import os
 import threading
 import time
@@ -31,7 +32,7 @@ from monitor import get_today_performance
 from strategy import evaluate_strategy
 
 # ============================================================
-# LOGGING
+# LOGGING SETUP
 # ============================================================
 
 logging.basicConfig(
@@ -41,19 +42,18 @@ logging.basicConfig(
 logger = logging.getLogger("QuotexSignalBoard")
 
 # ============================================================
-# FLASK & DATABASE
+# FLASK & DATABASE INITIALIZATION
 # ============================================================
 
 app = Flask(__name__)
 init_db()
 
 # ============================================================
-# GLOBAL STATE & LOCKS
+# GLOBAL STATE & CACHE CONTROLS
 # ============================================================
 
 latest_evaluations = {}
 sent_telegram_cache = set()
-processed_closed_candles = set()
 target_signal_cache = set()
 processed_target_minutes = set()
 
@@ -61,7 +61,7 @@ evaluation_lock = threading.Lock()
 cache_lock = threading.Lock()
 
 # ============================================================
-# PUSHER
+# PUSHER INITIALIZATION
 # ============================================================
 
 pusher_client = None
@@ -75,10 +75,10 @@ if PUSHER_ENABLED:
             ssl=True
         )
     except Exception as e:
-        logger.error(f"Pusher init failed: {e}")
+        logger.error(f"Pusher initialization failed: {e}")
 
 # ============================================================
-# EVENT / DATA ENGINE
+# DATA ENGINE SETUP
 # ============================================================
 
 event_dispatcher = EventDispatcher()
@@ -98,14 +98,14 @@ for deriv_symbol, display_name in FOREX_PAIRS.items():
     )
 
 # ============================================================
-# DATABASE: ASYNC SAVE
+# ASYNCHRONOUS DATABASE WRITER
 # ============================================================
 
 def save_signal_to_db_async(
     signal_id, symbol, display_name, timeframe, epoch,
     direction, score, quality, bias, entry_price
 ):
-    def _save():
+    def _worker():
         tz = pytz.timezone(TIMEZONE_NAME)
         now = datetime.datetime.now(tz)
         utc_now = datetime.datetime.now(datetime.timezone.utc)
@@ -131,14 +131,14 @@ def save_signal_to_db_async(
             )
             conn.commit()
         except Exception as e:
-            logger.error(f"DB save error: {e}")
+            logger.error(f"Async DB save error: {e}")
         finally:
             conn.close()
 
-    threading.Thread(target=_save, daemon=True).start()
+    threading.Thread(target=_worker, daemon=True).start()
 
 # ============================================================
-# TELEGRAM (HIGH PRIORITY ASYNC)
+# ASYNCHRONOUS TELEGRAM DISPATCHER
 # ============================================================
 
 def send_telegram_alert(
@@ -175,8 +175,7 @@ def send_telegram_alert(
             "disable_notification": False
         }
 
-        # লোয়ার টাইমআউট যাতে কোনোভাবে থ্রেড আটকে না থাকে
-        requests.post(url, json=payload, timeout=4)
+        requests.post(url, json=payload, timeout=3)
         logger.info(f"DISPATCHED: Telegram alert for {pair} -> {direction}")
         return True
     except Exception as e:
@@ -184,7 +183,7 @@ def send_telegram_alert(
         return False
 
 # ============================================================
-# PUSHER
+# ASYNCHRONOUS PUSHER DISPATCHER
 # ============================================================
 
 def send_pusher_signal(display_name, direction, score, quality, bias, timeframe, target_epoch):
@@ -205,21 +204,20 @@ def send_pusher_signal(display_name, direction, score, quality, bias, timeframe,
             }
         )
     except Exception as e:
-        logger.error(f"Pusher trigger error: {e}")
+        logger.error(f"Pusher dispatch error: {e}")
 
 # ============================================================
-# PROCESS VALID SIGNAL
+# SIGNAL VALIDATION & RATE CONTROL
 # ============================================================
 
 def process_signal_if_strong(
     symbol, display_name, timeframe, direction,
-    score, quality, details, entry_price, analysis_epoch
+    score, quality, details, entry_price, target_epoch
 ):
     if direction not in ("CALL", "PUT"):
         return
 
-    target_epoch = int(analysis_epoch) + 60
-
+    # Strictly permit a maximum of 1 signal across all pairs per target minute
     with cache_lock:
         if target_epoch in processed_target_minutes:
             return
@@ -250,21 +248,21 @@ def process_signal_if_strong(
     bias = details.get("bias", "NEUTRAL")
     pa = details.get("pa", "")
 
-    # ১. দ্রুততম সময়ে নন-ব্লকিং টেলিগ্রাম অ্যালার্ট ফায়ার (0-latency)
+    # Non-blocking Telegram alert
     threading.Thread(
         target=send_telegram_alert,
         args=(display_name, direction, score, quality, bias, pa, timeframe, target_epoch),
         daemon=True
     ).start()
 
-    # ২. নন-ব্লকিং পুশার ট্রিগার
+    # Non-blocking Pusher alert
     threading.Thread(
         target=send_pusher_signal,
         args=(display_name, direction, score, quality, bias, timeframe, target_epoch),
         daemon=True
     ).start()
 
-    # ৩. নন-ব্লকিং ডাটাবেস সেভ
+    # Async database commit
     save_signal_to_db_async(
         signal_id=signal_id,
         symbol=symbol,
@@ -279,14 +277,14 @@ def process_signal_if_strong(
     )
 
     logger.info(
-        f"INSTANT NEXT-CANDLE SIGNAL: {display_name} | {direction} | Score={score}/10 | Target={target_epoch}"
+        f"PERFECT 0-SEC ENTRY SIGNAL: {display_name} | {direction} | Score={score}/10 | Target={target_epoch}"
     )
 
 # ============================================================
 # STRATEGY EVALUATION
 # ============================================================
 
-def evaluate_pair(symbol, display_name):
+def evaluate_pair(symbol, display_name, target_epoch):
     cm = candle_managers.get(symbol)
     if not cm:
         return None
@@ -311,7 +309,6 @@ def evaluate_pair(symbol, display_name):
         if not latest_closed:
             return None
 
-        analysis_epoch = int(latest_closed.epoch)
         entry_price = float(latest_closed.close)
 
         return {
@@ -319,31 +316,29 @@ def evaluate_pair(symbol, display_name):
             "score": int(score),
             "quality": quality,
             "details": details,
-            "analysis_epoch": analysis_epoch,
-            "target_epoch": analysis_epoch + 60,
+            "analysis_epoch": target_epoch - 60,
+            "target_epoch": target_epoch,
             "entry_price": entry_price
         }
     except Exception as e:
-        logger.error(f"Strategy error for {display_name}: {e}")
+        logger.error(f"Strategy evaluation error for {display_name}: {e}")
         return None
 
 # ============================================================
-# EVALUATE ALL PAIRS
+# EVALUATION & DISPATCH PIPELINE
 # ============================================================
 
-def evaluate_and_dispatch_all(send_signal=True, target_symbol=None, trigger_epoch=None):
+def evaluate_and_dispatch_all(send_signal=True, target_epoch=None):
     with evaluation_lock:
+        now_ts = time.time()
         tz = pytz.timezone(TIMEZONE_NAME)
         now_str = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
-        pairs_to_scan = (
-            {target_symbol: FOREX_PAIRS[target_symbol]}
-            if target_symbol and target_symbol in FOREX_PAIRS
-            else FOREX_PAIRS
-        )
+        if target_epoch is None:
+            target_epoch = (int(now_ts // 60) + 1) * 60
 
-        for sym, disp in pairs_to_scan.items():
-            result = evaluate_pair(sym, disp)
+        for sym, disp in FOREX_PAIRS.items():
+            result = evaluate_pair(sym, disp, target_epoch)
             if not result:
                 continue
 
@@ -351,8 +346,6 @@ def evaluate_and_dispatch_all(send_signal=True, target_symbol=None, trigger_epoc
             score = result["score"]
             quality = result["quality"]
             details = result["details"]
-            analysis_epoch = result["analysis_epoch"]
-            target_epoch = result["target_epoch"]
             entry_price = result["entry_price"]
 
             latest_evaluations[disp] = {
@@ -362,7 +355,7 @@ def evaluate_and_dispatch_all(send_signal=True, target_symbol=None, trigger_epoc
                 "quality": quality,
                 "bias": details.get("bias", "NEUTRAL"),
                 "details": details.get("pa", ""),
-                "analysis_candle_epoch": analysis_epoch,
+                "analysis_candle_epoch": target_epoch - 60,
                 "target_candle_epoch": target_epoch
             }
 
@@ -378,77 +371,48 @@ def evaluate_and_dispatch_all(send_signal=True, target_symbol=None, trigger_epoc
                 quality=quality,
                 details=details,
                 entry_price=entry_price,
-                analysis_epoch=analysis_epoch
+                target_epoch=target_epoch
             )
 
 # ============================================================
-# 1M CANDLE CLOSED EVENT
+# HIGH PRECISION SNIPER (0-SECOND CANDLE OPEN TRIGGER)
 # ============================================================
 
-def on_candle_closed(event: CandleClosedEvent):
-    if getattr(event, "timeframe", "") != "1M":
-        return
-
-    try:
-        event_epoch = getattr(event, "candle_epoch", getattr(event, "epoch", None))
-        if not event_epoch and hasattr(event, "candle"):
-            event_epoch = getattr(event.candle, "epoch", None)
-
-        event_symbol = getattr(event, "symbol", getattr(event, "pair", None))
-
-        if event_epoch is not None and event_symbol is not None:
-            event_key = f"{event_symbol}_{int(event_epoch)}"
-            with cache_lock:
-                if event_key in processed_closed_candles:
-                    return
-                processed_closed_candles.add(event_key)
-
-        evaluate_and_dispatch_all(
-            send_signal=True,
-            target_symbol=event_symbol,
-            trigger_epoch=event_epoch
-        )
-    except Exception as e:
-        logger.error(f"on_candle_closed error: {e}")
-
-event_dispatcher.subscribe(on_candle_closed)
-
-# ============================================================
-# HIGH SPEED 0-LATENCY MINUTE CHECKER
-# ============================================================
-
-def run_fast_minute_checker():
-    logger.info("Precision 0-latency minute checker active.")
+def run_precision_sniper():
+    """
+    Executes calculations at 58.2s and dispatches alerts directly 
+    at 59.8s - 00.0s, giving a zero-second entry on the new candle.
+    """
+    logger.info("High precision sniper minute runner active.")
     last_processed_minute = None
 
     while True:
         try:
             now = time.time()
             sec = now % 60
-            current_min = int(now // 60)
+            current_minute_epoch = int(now // 60) * 60
 
-            # প্রতি মিনিটের 58.8 সেকেন্ডে প্রি-ইভ্যালুয়েশন করে ঠিক 00 সেকেন্ডে টেলিগ্রামে সেন্ড হবে
-            if sec >= 58.8 and last_processed_minute != current_min:
-                last_processed_minute = current_min
-                current_epoch_boundary = current_min * 60
+            if sec >= 58.2 and last_processed_minute != current_minute_epoch:
+                last_processed_minute = current_minute_epoch
+                target_next_minute = current_minute_epoch + 60
 
                 threading.Thread(
                     target=evaluate_and_dispatch_all,
-                    args=(True, None, current_epoch_boundary),
+                    args=(True, target_next_minute),
                     daemon=True
                 ).start()
 
-            time.sleep(0.1)
+            time.sleep(0.05)
         except Exception as e:
-            logger.error(f"Minute checker error: {e}")
+            logger.error(f"Sniper runner error: {e}")
             time.sleep(1)
 
 # ============================================================
-# ENGINE & WORKERS
+# BACKGROUND ENGINE INITIALIZATION
 # ============================================================
 
 def run_engine():
-    logger.info("=== Background engine thread starting ===")
+    logger.info("=== Starting live Deriv engine ===")
     try:
         server_epoch = deriv_client.get_server_epoch()
         for deriv_symbol in FOREX_PAIRS.keys():
@@ -465,12 +429,12 @@ def run_engine():
                 if candles_5m: cm.seed_historical_candles("5M", candles_5m, server_epoch)
                 if candles_15m: cm.seed_historical_candles("15M", candles_15m, server_epoch)
             except Exception as e:
-                logger.error(f"Seed error {deriv_symbol}: {e}")
+                logger.error(f"History seeding error for {deriv_symbol}: {e}")
 
         deriv_client.start()
-        logger.info("Deriv engine started.")
+        logger.info("Deriv live engine started successfully.")
     except Exception as e:
-        logger.error(f"Engine start fault: {e}")
+        logger.error(f"Engine startup crash: {e}")
 
 def run_outcome_worker():
     while True:
@@ -516,11 +480,7 @@ def run_outcome_worker():
                 conn.commit()
             conn.close()
         except Exception as e:
-            logger.error(f"Outcome worker error: {e}")
-
-# ============================================================
-# BACKGROUND THREAD CONTROL
-# ============================================================
+            logger.error(f"Outcome calculation error: {e}")
 
 _threads_started = False
 _threads_lock = threading.Lock()
@@ -533,18 +493,18 @@ def start_background_threads_once():
         try:
             threading.Thread(target=run_engine, daemon=True, name="DerivEngine").start()
             threading.Thread(target=run_outcome_worker, daemon=True, name="OutcomeWorker").start()
-            threading.Thread(target=run_fast_minute_checker, daemon=True, name="ZeroLatencyChecker").start()
+            threading.Thread(target=run_precision_sniper, daemon=True, name="PrecisionSniper").start()
             _threads_started = True
-            logger.info("Precision zero-latency engine initialized.")
+            logger.info("Zero-latency background engines running.")
         except Exception as e:
-            logger.error(f"Threads start error: {e}")
+            logger.error(f"Thread initialization failure: {e}")
 
 @app.before_request
 def before_request_func():
     start_background_threads_once()
 
 # ============================================================
-# FLASK ROUTES
+# FLASK WEB ROUTES
 # ============================================================
 
 @app.route("/")

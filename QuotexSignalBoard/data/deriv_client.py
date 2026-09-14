@@ -30,14 +30,21 @@ class DerivClient:
         self._tick_subscribers: Dict[str, Callable[[int, float, float], None]] = {}
         self._history_callbacks: Dict[str, Callable[[dict], None]] = {}
         self._backoff = 1
+        self.connected_at_local: float = 0.0
+        self.last_tick_local: float = 0.0
+        self._watchdog_thread: Optional[threading.Thread] = None
 
     def register_tick_handler(self, symbol: str, handler: Callable[[int, float, float], None]):
         self._tick_subscribers[symbol] = handler
 
     def start(self):
+        if self._is_running:
+            return
         self._is_running = True
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
+        self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
+        self._watchdog_thread.start()
 
     def stop(self):
         self._is_running = False
@@ -81,6 +88,8 @@ class DerivClient:
 
     def _on_open(self, ws):
         self.is_connected = True
+        self.connected_at_local = time.time()
+        self.last_tick_local = 0.0
         self._backoff = 1
         logger.info("Deriv WebSocket connection established. Synchronizing server time & subscriptions...")
         
@@ -116,6 +125,7 @@ class DerivClient:
                 symbol = tick_data.get("symbol")
                 quote = float(tick_data.get("quote", 0.0))
                 epoch = int(tick_data.get("epoch", math.floor(local_receipt)))
+                self.last_tick_local = local_receipt
                 
                 logger.info(f"Received live tick -> Symbol: {symbol} | Quote: {quote}")
 
@@ -140,6 +150,86 @@ class DerivClient:
     def _on_close(self, ws, close_status_code, close_msg):
         self.is_connected = False
         logger.info(f"Deriv WebSocket closed: {close_status_code} - {close_msg}")
+
+    def _watchdog_loop(self):
+        """Reconnect a socket that is connected but not delivering ticks."""
+        while self._is_running:
+            try:
+                time.sleep(5)
+                if not self.is_connected or not self.ws:
+                    continue
+
+                reference = self.last_tick_local or self.connected_at_local
+                if reference and (time.time() - reference) > 30:
+                    logger.warning("No Deriv ticks for 30 seconds; forcing WebSocket reconnect.")
+                    self.ws.close()
+            except Exception as e:
+                logger.error(f"Deriv watchdog error: {e}")
+
+    def fetch_server_epoch_sync(self) -> int:
+        temp_ws = None
+        try:
+            temp_ws = websocket.create_connection(self.ws_url, timeout=10)
+            temp_ws.send(json.dumps({"time": 1}))
+            payload = json.loads(temp_ws.recv())
+            return int(payload.get("time", math.floor(time.time())))
+        except Exception as e:
+            logger.error(f"Failed to fetch Deriv server time: {e}")
+            return math.floor(self.get_server_time())
+        finally:
+            if temp_ws:
+                temp_ws.close()
+
+    def fetch_historical_candles_batch_sync(self, requests_list: List[dict]) -> Dict[str, List[dict]]:
+        """Fetch many candle histories over one temporary WebSocket."""
+        results: Dict[str, List[dict]] = {}
+        temp_ws = None
+        try:
+            temp_ws = websocket.create_connection(self.ws_url, timeout=15)
+            pending = set()
+
+            for index, item in enumerate(requests_list):
+                request_id = index + 1
+                pending.add(request_id)
+                temp_ws.send(json.dumps({
+                    "ticks_history": item["symbol"],
+                    "adjust_start_time": 1,
+                    "count": item["count"],
+                    "end": "latest",
+                    "granularity": item["granularity"],
+                    "style": "candles",
+                    "req_id": request_id,
+                }))
+
+            deadline = time.time() + 25
+            while pending and time.time() < deadline:
+                payload = json.loads(temp_ws.recv())
+                request_id = payload.get("req_id")
+                if request_id not in pending:
+                    continue
+
+                pending.remove(request_id)
+                item = requests_list[int(request_id) - 1]
+                key = item["key"]
+                if payload.get("error"):
+                    logger.error(
+                        "Deriv history error for %s: %s",
+                        key,
+                        payload.get("error", {}).get("message", "unknown error"),
+                    )
+                    results[key] = []
+                else:
+                    results[key] = payload.get("candles", [])
+
+            if pending:
+                logger.warning("Historical batch timed out with %s pending request(s).", len(pending))
+            return results
+        except Exception as e:
+            logger.error(f"Historical batch fetch failed: {e}")
+            return results
+        finally:
+            if temp_ws:
+                temp_ws.close()
 
     def fetch_historical_candles_sync(self, symbol: str, count: int = 120, granularity: int = 60) -> List[dict]:
         try:

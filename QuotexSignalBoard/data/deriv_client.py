@@ -17,19 +17,25 @@ class DerivClient:
         self.server_time = int(time.time())
         self.connected = False
         self.tick_handlers = {}
+        self.historical_data = {}
         
     @property
     def is_connected(self):
         return self.connected
 
     def get_server_time(self):
-        return self.server_time
+        return int(time.time())
 
     def fetch_server_epoch_sync(self):
         return int(time.time())
 
     def fetch_historical_candles_batch_sync(self, jobs):
-        return {}
+        # Synchronous helper or fallback structure for history manager
+        results = {}
+        for job in jobs:
+            key = job.get("key")
+            results[key] = []
+        return results
 
     def register_tick_handler(self, symbol, handler):
         self.tick_handlers[symbol] = handler

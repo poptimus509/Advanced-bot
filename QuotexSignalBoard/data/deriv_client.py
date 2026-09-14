@@ -28,7 +28,6 @@ class DerivClient:
         return int(time.time())
 
     def fetch_historical_candles_batch_sync(self, jobs):
-        # Fallback empty dict to prevent crash during history refresh
         return {}
 
     def start(self):
@@ -73,7 +72,6 @@ class DerivClient:
         logger.info(f"ACTIVE_SYMBOL_DIAGNOSTIC: Attempting to subscribe to {len(ACTIVE_SYMBOLS)} pairs.")
         
         for symbol in ACTIVE_SYMBOLS:
-            # Try raw symbol or handle prefix cleanly without forcing failing frx if rejected
             clean_symbol = symbol.replace("frx", "")
             for target_sym in [symbol, clean_symbol, f"frx{clean_symbol}"]:
                 req = {"ticks": target_sym, "subscribe": 1}
@@ -100,7 +98,6 @@ class DerivClient:
                 err = data.get("error", {})
                 err_code = err.get("code")
                 err_msg = err.get("message")
-                # Log as warning instead of crashing or flooding error
                 logger.warning(f"DerivClient Warning/Error [{err_code}]: {err_msg}")
                 
             elif msg_type == "authorize":

@@ -41,20 +41,23 @@ logging.basicConfig(
 logger = logging.getLogger("QuotexSignalBoard")
 
 # ============================================================
-# FLASK & DB
+# FLASK & DATABASE
 # ============================================================
 
 app = Flask(__name__)
 init_db()
 
 # ============================================================
-# GLOBAL STATE
+# GLOBAL STATE & LOCKS
 # ============================================================
 
 latest_evaluations = {}
 sent_telegram_cache = set()
 processed_closed_candles = set()
 target_signal_cache = set()
+
+# প্রতি টার্গেট মিনিটে সর্বোচ্চ একটি সিগন্যাল অনুমোদন করার জন্য গ্লোবাল সেট
+processed_target_minutes = set()
 
 evaluation_lock = threading.Lock()
 cache_lock = threading.Lock()
@@ -177,7 +180,7 @@ def send_telegram_alert(
             logger.info(f"SUCCESS: Telegram alert sent for {pair} -> {direction} (Score: {score}/10)")
             return True
 
-        logger.error(f"Failed to send Telegram alert: {response.status_code}, {response.text}")
+        logger.error(f"Failed to send Telegram alert: Status {response.status_code}, Response: {response.text}")
         return False
     except Exception as e:
         logger.error(f"Telegram dispatch error exception: {e}")
@@ -208,7 +211,7 @@ def send_pusher_signal(display_name, direction, score, quality, bias, timeframe,
         logger.error(f"Pusher trigger error: {e}")
 
 # ============================================================
-# PROCESS VALID SIGNAL
+# PROCESS VALID SIGNAL (WITH RATE LIMITER)
 # ============================================================
 
 def process_signal_if_strong(
@@ -218,31 +221,35 @@ def process_signal_if_strong(
     if direction not in ("CALL", "PUT"):
         return
 
+    target_epoch = int(analysis_epoch) + 60
+
+    # 1. প্রতি ১ মিনিটে যাতে একাধিক সিগন্যাল স্প্যাম না হয় তার গ্লোবাল লক
+    with cache_lock:
+        if target_epoch in processed_target_minutes:
+            return
+
     try:
         threshold = int(SIGNAL_THRESHOLD_CALL_PUT)
     except Exception:
-        threshold = 6
+        threshold = 7
 
     if threshold < 1:
-        threshold = 6
+        threshold = 7
 
     if score < threshold:
         return
 
-    target_epoch = int(analysis_epoch) + 60
     target_key = f"{symbol}_{timeframe}_{target_epoch}"
     signal_key = f"{symbol}_{timeframe}_{target_epoch}_{direction}"
 
     with cache_lock:
-        if target_key in target_signal_cache:
-            logger.info(f"Signal already generated for {display_name} target candle {target_epoch}. Skipping.")
-            return
-
-        if signal_key in sent_telegram_cache:
+        if target_key in target_signal_cache or signal_key in sent_telegram_cache:
             return
 
         target_signal_cache.add(target_key)
         sent_telegram_cache.add(signal_key)
+        # একই মিনিটে অন্য কোনো পেয়ারের সিগন্যাল ব্লক করতে রিজার্ভ করা হলো
+        processed_target_minutes.add(target_epoch)
 
     signal_id = f"{symbol}_{timeframe}_{target_epoch}"
     bias = details.get("bias", "NEUTRAL")
@@ -300,7 +307,6 @@ def evaluate_pair(symbol, display_name):
         df_5m = cm.get_closed_history("5M")
         df_15m = cm.get_closed_history("15M")
 
-        # Minimum required candles to run indicators safely
         if df_1m is None or len(df_1m) < 25:
             return None
 
@@ -343,8 +349,11 @@ def evaluate_and_dispatch_all(send_signal=True, target_symbol=None, trigger_epoc
         tz = pytz.timezone(TIMEZONE_NAME)
         now_str = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
-        # If a single symbol triggered, prioritize it; otherwise scan all
-        pairs_to_scan = {target_symbol: FOREX_PAIRS[target_symbol]} if target_symbol and target_symbol in FOREX_PAIRS else FOREX_PAIRS
+        pairs_to_scan = (
+            {target_symbol: FOREX_PAIRS[target_symbol]}
+            if target_symbol and target_symbol in FOREX_PAIRS
+            else FOREX_PAIRS
+        )
 
         for sym, disp in pairs_to_scan.items():
             result = evaluate_pair(sym, disp)
@@ -389,7 +398,7 @@ def evaluate_and_dispatch_all(send_signal=True, target_symbol=None, trigger_epoc
             )
 
 # ============================================================
-# 1M CANDLE CLOSED EVENT HANDLER
+# 1M CANDLE CLOSED EVENT
 # ============================================================
 
 def on_candle_closed(event: CandleClosedEvent):
@@ -400,10 +409,7 @@ def on_candle_closed(event: CandleClosedEvent):
         event_epoch = getattr(event, "epoch", None)
         event_symbol = getattr(event, "symbol", getattr(event, "pair", None))
 
-        logger.info(f"1M CANDLE CLOSED: symbol={event_symbol}, epoch={event_epoch}")
-
         if event_epoch is not None and event_symbol is not None:
-            # FIX: Pair symbol included in key to prevent multi-pair locking
             event_key = f"{event_symbol}_{int(event_epoch)}"
 
             with cache_lock:
@@ -423,7 +429,7 @@ def on_candle_closed(event: CandleClosedEvent):
 event_dispatcher.subscribe(on_candle_closed)
 
 # ============================================================
-# FAST MINUTE CHECKER
+# FAST MINUTE CHECKER (RECOVERY MODE)
 # ============================================================
 
 def run_fast_minute_checker():
@@ -439,7 +445,7 @@ def run_fast_minute_checker():
                 last_minute = current_minute
             elif current_minute != last_minute:
                 last_minute = current_minute
-                time.sleep(1.5)
+                time.sleep(2.0)
 
                 for sym, disp in FOREX_PAIRS.items():
                     cm = candle_managers.get(sym)
@@ -459,8 +465,6 @@ def run_fast_minute_checker():
                     if already_processed:
                         continue
 
-                    logger.warning(f"Missed candle event detected for {disp}. Running recovery.")
-
                     with cache_lock:
                         processed_closed_candles.add(recovery_key)
 
@@ -469,6 +473,8 @@ def run_fast_minute_checker():
                         target_symbol=sym,
                         trigger_epoch=closed_epoch
                     )
+                    # প্রতি মিনিটে রিকভারি থেকে একটি পেয়ারের বেশি সিগন্যাল ট্রিগার হতে দেওয়া হবে না
+                    break
 
             time.sleep(0.5)
         except Exception as e:

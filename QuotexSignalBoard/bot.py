@@ -55,8 +55,6 @@ latest_evaluations = {}
 sent_telegram_cache = set()
 processed_closed_candles = set()
 target_signal_cache = set()
-
-# প্রতি টার্গেট মিনিটে সর্বোচ্চ একটি সিগন্যাল অনুমোদন করার জন্য গ্লোবাল সেট
 processed_target_minutes = set()
 
 evaluation_lock = threading.Lock()
@@ -100,44 +98,47 @@ for deriv_symbol, display_name in FOREX_PAIRS.items():
     )
 
 # ============================================================
-# DATABASE: SAVE SIGNAL
+# DATABASE: ASYNC SAVE
 # ============================================================
 
-def save_signal_to_db(
+def save_signal_to_db_async(
     signal_id, symbol, display_name, timeframe, epoch,
     direction, score, quality, bias, entry_price
 ):
-    tz = pytz.timezone(TIMEZONE_NAME)
-    now = datetime.datetime.now(tz)
-    utc_now = datetime.datetime.now(datetime.timezone.utc)
+    def _save():
+        tz = pytz.timezone(TIMEZONE_NAME)
+        now = datetime.datetime.now(tz)
+        utc_now = datetime.datetime.now(datetime.timezone.utc)
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            """
-            INSERT OR IGNORE INTO signal_history (
-                signal_id, symbol, display_pair, timeframe, candle_epoch,
-                signal_timestamp_utc, signal_timestamp_bdt, direction, score,
-                quality, bias_15m, entry_reference_price,
-                entry_reference_timestamp, result, created_at
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO signal_history (
+                    signal_id, symbol, display_pair, timeframe, candle_epoch,
+                    signal_timestamp_utc, signal_timestamp_bdt, direction, score,
+                    quality, bias_15m, entry_reference_price,
+                    entry_reference_timestamp, result, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
+                """,
+                (
+                    signal_id, symbol, display_name, timeframe, epoch,
+                    utc_now.isoformat(), now.isoformat(), direction, score,
+                    quality, bias, entry_price, utc_now.isoformat(), now.isoformat()
+                )
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
-            """,
-            (
-                signal_id, symbol, display_name, timeframe, epoch,
-                utc_now.isoformat(), now.isoformat(), direction, score,
-                quality, bias, entry_price, utc_now.isoformat(), now.isoformat()
-            )
-        )
-        conn.commit()
-    except Exception as e:
-        logger.error(f"DB save error: {e}")
-    finally:
-        conn.close()
+            conn.commit()
+        except Exception as e:
+            logger.error(f"DB save error: {e}")
+        finally:
+            conn.close()
+
+    threading.Thread(target=_save, daemon=True).start()
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM (HIGH PRIORITY ASYNC)
 # ============================================================
 
 def send_telegram_alert(
@@ -145,7 +146,6 @@ def send_telegram_alert(
     details_str, timeframe="1M", target_epoch=None
 ):
     if not TELEGRAM_ENABLED or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram alerts are disabled or credentials missing.")
         return False
 
     try:
@@ -175,15 +175,12 @@ def send_telegram_alert(
             "disable_notification": False
         }
 
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code == 200:
-            logger.info(f"SUCCESS: Telegram alert sent for {pair} -> {direction} (Score: {score}/10)")
-            return True
-
-        logger.error(f"Failed to send Telegram alert: Status {response.status_code}, Response: {response.text}")
-        return False
+        # লোয়ার টাইমআউট যাতে কোনোভাবে থ্রেড আটকে না থাকে
+        requests.post(url, json=payload, timeout=4)
+        logger.info(f"DISPATCHED: Telegram alert for {pair} -> {direction}")
+        return True
     except Exception as e:
-        logger.error(f"Telegram dispatch error exception: {e}")
+        logger.error(f"Telegram dispatch error: {e}")
         return False
 
 # ============================================================
@@ -211,7 +208,7 @@ def send_pusher_signal(display_name, direction, score, quality, bias, timeframe,
         logger.error(f"Pusher trigger error: {e}")
 
 # ============================================================
-# PROCESS VALID SIGNAL (WITH RATE LIMITER)
+# PROCESS VALID SIGNAL
 # ============================================================
 
 def process_signal_if_strong(
@@ -223,7 +220,6 @@ def process_signal_if_strong(
 
     target_epoch = int(analysis_epoch) + 60
 
-    # 1. প্রতি ১ মিনিটে যাতে একাধিক সিগন্যাল স্প্যাম না হয় তার গ্লোবাল লক
     with cache_lock:
         if target_epoch in processed_target_minutes:
             return
@@ -248,14 +244,28 @@ def process_signal_if_strong(
 
         target_signal_cache.add(target_key)
         sent_telegram_cache.add(signal_key)
-        # একই মিনিটে অন্য কোনো পেয়ারের সিগন্যাল ব্লক করতে রিজার্ভ করা হলো
         processed_target_minutes.add(target_epoch)
 
     signal_id = f"{symbol}_{timeframe}_{target_epoch}"
     bias = details.get("bias", "NEUTRAL")
     pa = details.get("pa", "")
 
-    save_signal_to_db(
+    # ১. দ্রুততম সময়ে নন-ব্লকিং টেলিগ্রাম অ্যালার্ট ফায়ার (0-latency)
+    threading.Thread(
+        target=send_telegram_alert,
+        args=(display_name, direction, score, quality, bias, pa, timeframe, target_epoch),
+        daemon=True
+    ).start()
+
+    # ২. নন-ব্লকিং পুশার ট্রিগার
+    threading.Thread(
+        target=send_pusher_signal,
+        args=(display_name, direction, score, quality, bias, timeframe, target_epoch),
+        daemon=True
+    ).start()
+
+    # ৩. নন-ব্লকিং ডাটাবেস সেভ
+    save_signal_to_db_async(
         signal_id=signal_id,
         symbol=symbol,
         display_name=display_name,
@@ -268,33 +278,12 @@ def process_signal_if_strong(
         entry_price=entry_price
     )
 
-    telegram_sent = send_telegram_alert(
-        pair=display_name,
-        direction=direction,
-        score=score,
-        quality=quality,
-        bias=bias,
-        details_str=pa,
-        timeframe=timeframe,
-        target_epoch=target_epoch
-    )
-
-    send_pusher_signal(
-        display_name=display_name,
-        direction=direction,
-        score=score,
-        quality=quality,
-        bias=bias,
-        timeframe=timeframe,
-        target_epoch=target_epoch
-    )
-
     logger.info(
-        f"NEXT-CANDLE SIGNAL: {display_name} | {direction} | Score={score}/10 | Target={target_epoch} | Telegram={telegram_sent}"
+        f"INSTANT NEXT-CANDLE SIGNAL: {display_name} | {direction} | Score={score}/10 | Target={target_epoch}"
     )
 
 # ============================================================
-# STRATEGY EVALUATION ONLY
+# STRATEGY EVALUATION
 # ============================================================
 
 def evaluate_pair(symbol, display_name):
@@ -309,7 +298,6 @@ def evaluate_pair(symbol, display_name):
 
         if df_1m is None or len(df_1m) < 25:
             return None
-
         if df_5m is None or len(df_5m) < 20:
             return None
 
@@ -335,9 +323,8 @@ def evaluate_pair(symbol, display_name):
             "target_epoch": analysis_epoch + 60,
             "entry_price": entry_price
         }
-
     except Exception as e:
-        logger.error(f"Strategy evaluation error for {display_name}: {e}")
+        logger.error(f"Strategy error for {display_name}: {e}")
         return None
 
 # ============================================================
@@ -382,9 +369,6 @@ def evaluate_and_dispatch_all(send_signal=True, target_symbol=None, trigger_epoc
             if not send_signal:
                 continue
 
-            if trigger_epoch is not None and analysis_epoch != int(trigger_epoch):
-                continue
-
             process_signal_if_strong(
                 symbol=sym,
                 display_name=disp,
@@ -406,12 +390,14 @@ def on_candle_closed(event: CandleClosedEvent):
         return
 
     try:
-        event_epoch = getattr(event, "epoch", None)
+        event_epoch = getattr(event, "candle_epoch", getattr(event, "epoch", None))
+        if not event_epoch and hasattr(event, "candle"):
+            event_epoch = getattr(event.candle, "epoch", None)
+
         event_symbol = getattr(event, "symbol", getattr(event, "pair", None))
 
         if event_epoch is not None and event_symbol is not None:
             event_key = f"{event_symbol}_{int(event_epoch)}"
-
             with cache_lock:
                 if event_key in processed_closed_candles:
                     return
@@ -422,111 +408,69 @@ def on_candle_closed(event: CandleClosedEvent):
             target_symbol=event_symbol,
             trigger_epoch=event_epoch
         )
-
     except Exception as e:
         logger.error(f"on_candle_closed error: {e}")
 
 event_dispatcher.subscribe(on_candle_closed)
 
 # ============================================================
-# FAST MINUTE CHECKER (RECOVERY MODE)
+# HIGH SPEED 0-LATENCY MINUTE CHECKER
 # ============================================================
 
 def run_fast_minute_checker():
-    logger.info("Fast minute checker started (recovery mode).")
-    last_minute = None
+    logger.info("Precision 0-latency minute checker active.")
+    last_processed_minute = None
 
     while True:
         try:
-            current_epoch = int(time.time() // 60) * 60
-            current_minute = current_epoch // 60
+            now = time.time()
+            sec = now % 60
+            current_min = int(now // 60)
 
-            if last_minute is None:
-                last_minute = current_minute
-            elif current_minute != last_minute:
-                last_minute = current_minute
-                time.sleep(2.0)
+            # প্রতি মিনিটের 58.8 সেকেন্ডে প্রি-ইভ্যালুয়েশন করে ঠিক 00 সেকেন্ডে টেলিগ্রামে সেন্ড হবে
+            if sec >= 58.8 and last_processed_minute != current_min:
+                last_processed_minute = current_min
+                current_epoch_boundary = current_min * 60
 
-                for sym, disp in FOREX_PAIRS.items():
-                    cm = candle_managers.get(sym)
-                    if not cm:
-                        continue
+                threading.Thread(
+                    target=evaluate_and_dispatch_all,
+                    args=(True, None, current_epoch_boundary),
+                    daemon=True
+                ).start()
 
-                    latest_closed = cm.get_latest_closed_candle("1M")
-                    if not latest_closed:
-                        continue
-
-                    closed_epoch = int(latest_closed.epoch)
-                    recovery_key = f"{sym}_{closed_epoch}"
-
-                    with cache_lock:
-                        already_processed = recovery_key in processed_closed_candles
-
-                    if already_processed:
-                        continue
-
-                    with cache_lock:
-                        processed_closed_candles.add(recovery_key)
-
-                    evaluate_and_dispatch_all(
-                        send_signal=True,
-                        target_symbol=sym,
-                        trigger_epoch=closed_epoch
-                    )
-                    # প্রতি মিনিটে রিকভারি থেকে একটি পেয়ারের বেশি সিগন্যাল ট্রিগার হতে দেওয়া হবে না
-                    break
-
-            time.sleep(0.5)
+            time.sleep(0.1)
         except Exception as e:
-            logger.error(f"Fast minute checker error: {e}")
-            time.sleep(5)
+            logger.error(f"Minute checker error: {e}")
+            time.sleep(1)
 
 # ============================================================
-# ENGINE START
+# ENGINE & WORKERS
 # ============================================================
 
 def run_engine():
     logger.info("=== Background engine thread starting ===")
     try:
         server_epoch = deriv_client.get_server_epoch()
-
         for deriv_symbol in FOREX_PAIRS.keys():
             try:
-                logger.info(f"Seeding history for {deriv_symbol}")
-                candles_1m = deriv_client.fetch_historical_candles_sync(
-                    deriv_symbol, count=120, granularity=60
-                )
-                candles_5m = deriv_client.fetch_historical_candles_sync(
-                    deriv_symbol, count=60, granularity=300
-                )
-                candles_15m = deriv_client.fetch_historical_candles_sync(
-                    deriv_symbol, count=40, granularity=900
-                )
+                candles_1m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=120, granularity=60)
+                candles_5m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=60, granularity=300)
+                candles_15m = deriv_client.fetch_historical_candles_sync(deriv_symbol, count=40, granularity=900)
 
                 if deriv_symbol not in candle_managers:
                     continue
 
                 cm = candle_managers[deriv_symbol]
-
-                if candles_1m:
-                    cm.seed_historical_candles("1M", candles_1m, server_epoch)
-                if candles_5m:
-                    cm.seed_historical_candles("5M", candles_5m, server_epoch)
-                if candles_15m:
-                    cm.seed_historical_candles("15M", candles_15m, server_epoch)
-
-                logger.info(f"History seeded successfully for {deriv_symbol}")
+                if candles_1m: cm.seed_historical_candles("1M", candles_1m, server_epoch)
+                if candles_5m: cm.seed_historical_candles("5M", candles_5m, server_epoch)
+                if candles_15m: cm.seed_historical_candles("15M", candles_15m, server_epoch)
             except Exception as e:
-                logger.error(f"Failed to seed history for {deriv_symbol}: {e}")
+                logger.error(f"Seed error {deriv_symbol}: {e}")
 
         deriv_client.start()
-        logger.info("Deriv live engine started.")
+        logger.info("Deriv engine started.")
     except Exception as e:
-        logger.error(f"Engine startup error: {e}")
-
-# ============================================================
-# OUTCOME WORKER
-# ============================================================
+        logger.error(f"Engine start fault: {e}")
 
 def run_outcome_worker():
     while True:
@@ -534,12 +478,10 @@ def run_outcome_worker():
             time.sleep(10)
             conn = get_db_connection()
             cursor = conn.cursor()
-
             cursor.execute(
                 """
                 SELECT signal_id, symbol, timeframe, candle_epoch, direction, entry_reference_price
-                FROM signal_history
-                WHERE result = 'PENDING'
+                FROM signal_history WHERE result = 'PENDING'
                 """
             )
             rows = cursor.fetchall()
@@ -554,13 +496,7 @@ def run_outcome_worker():
                     continue
 
                 latest_closed = cm.get_latest_closed_candle(tf)
-                if not latest_closed:
-                    continue
-
-                latest_epoch = int(latest_closed.epoch)
-                target_epoch = int(target_epoch)
-
-                if latest_epoch < target_epoch:
+                if not latest_closed or int(latest_closed.epoch) < int(target_epoch):
                     continue
 
                 exit_price = float(latest_closed.close)
@@ -574,16 +510,10 @@ def run_outcome_worker():
                     continue
 
                 cursor.execute(
-                    """
-                    UPDATE signal_history
-                    SET result = ?, exit_reference_price = ?
-                    WHERE signal_id = ?
-                    """,
+                    "UPDATE signal_history SET result = ?, exit_reference_price = ? WHERE signal_id = ?",
                     (outcome, exit_price, sig_id)
                 )
                 conn.commit()
-                logger.info(f"OUTCOME: {sym} | {direction} | {outcome} | Entry={entry_price} | Exit={exit_price}")
-
             conn.close()
         except Exception as e:
             logger.error(f"Outcome worker error: {e}")
@@ -600,16 +530,14 @@ def start_background_threads_once():
     with _threads_lock:
         if _threads_started:
             return
-
         try:
             threading.Thread(target=run_engine, daemon=True, name="DerivEngine").start()
             threading.Thread(target=run_outcome_worker, daemon=True, name="OutcomeWorker").start()
-            threading.Thread(target=run_fast_minute_checker, daemon=True, name="MinuteRecoveryChecker").start()
-
+            threading.Thread(target=run_fast_minute_checker, daemon=True, name="ZeroLatencyChecker").start()
             _threads_started = True
-            logger.info("Background engine & workers successfully initialized.")
+            logger.info("Precision zero-latency engine initialized.")
         except Exception as e:
-            logger.error(f"Failed to initialize background threads: {e}")
+            logger.error(f"Threads start error: {e}")
 
 @app.before_request
 def before_request_func():
@@ -655,16 +583,14 @@ def api_active_signals():
     )
     rows = cursor.fetchall()
     conn.close()
-
-    signals = [
+    return jsonify([
         {
             "signal_id": r[0], "pair": r[1], "timeframe": r[2], "timestamp": r[3],
             "direction": r[4], "score": r[5], "quality": r[6], "bias": r[7],
             "price": r[8], "target_candle_epoch": r[9]
         }
         for r in rows
-    ]
-    return jsonify(signals)
+    ])
 
 @app.route("/api/evaluations")
 def api_evaluations():
@@ -685,16 +611,14 @@ def api_history():
     )
     rows = cursor.fetchall()
     conn.close()
-
-    history = [
+    return jsonify([
         {
             "signal_id": r[0], "pair": r[1], "timeframe": r[2], "timestamp": r[3],
             "direction": r[4], "score": r[5], "quality": r[6], "bias": r[7],
             "entry_price": r[8], "exit_price": r[9], "result": r[10], "target_candle_epoch": r[11]
         }
         for r in rows
-    ]
-    return jsonify(history)
+    ])
 
 @app.route("/api/performance")
 def api_performance():

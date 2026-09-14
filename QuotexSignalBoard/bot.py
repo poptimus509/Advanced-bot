@@ -340,7 +340,9 @@ def evaluate_pair(symbol, display_name, target_epoch):
 
 def evaluate_and_dispatch_all(send_signal=True, target_epoch=None):
     with evaluation_lock:
-        now_ts = time.time()
+        # Candle epochs come from Deriv, so target boundaries must also use
+        # Deriv-aligned time instead of the hosting server's local clock.
+        now_ts = deriv_client.get_server_time()
         tz = pytz.timezone(TIMEZONE_NAME)
         now_str = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -442,7 +444,7 @@ def run_precision_sniper():
 
     while True:
         try:
-            now = time.time()
+            now = deriv_client.get_server_time()
             sec = now % 60
             current_minute_epoch = int(now // 60) * 60
 
@@ -594,7 +596,8 @@ def api_dashboard():
 
 @app.route("/api/evaluations")
 def api_evaluations():
-    evaluate_and_dispatch_all(send_signal=False)
+    # Dashboard polling must not start a second mid-minute evaluation. The
+    # precision runner refreshes this cache once per minute using closed data.
     return jsonify(latest_evaluations)
 
 @app.route("/api/active-signals")

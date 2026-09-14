@@ -126,7 +126,6 @@ class CandleManager:
 
                 df_history_1m = self._build_dataframe("1M")
                 
-                # FIX: epoch এবং candle_epoch উভয়ই পাস করা হলো যাতে কোনো অ্যাট্রিবিউট মিস না হয়
                 ev_1m = CandleClosedEvent(
                     symbol=self.symbol,
                     timeframe="1M",
@@ -206,9 +205,10 @@ class CandleManager:
     def _build_dataframe(self, timeframe: str) -> pd.DataFrame:
         candles = list(self._closed_candles[timeframe])
         if not candles:
-            return pd.DataFrame(columns=["open", "high", "low", "close", "tickscount"])
+            return pd.DataFrame(columns=["time", "epoch", "open", "high", "low", "close", "tickscount"])
         data = [{
             "time": c.epoch,
+            "epoch": c.epoch,
             "open": float(c.open),
             "high": float(c.high),
             "low": float(c.low),

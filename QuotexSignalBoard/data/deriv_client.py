@@ -17,7 +17,8 @@ class DerivClient:
         self.server_time = int(time.time())
         self.connected = False
         self.tick_handlers = {}
-        self.historical_data = {}
+        self.history_cache = {}
+        self.history_event = threading.Event()
         
     @property
     def is_connected(self):
@@ -30,11 +31,46 @@ class DerivClient:
         return int(time.time())
 
     def fetch_historical_candles_batch_sync(self, jobs):
-        # Synchronous helper or fallback structure for history manager
         results = {}
+        if not self.ws or not self.connected:
+            return results
+
         for job in jobs:
             key = job.get("key")
-            results[key] = []
+            symbol = job.get("symbol")
+            count = job.get("count", 100)
+            granularity = job.get("granularity", 60)
+            
+            clean_symbol = symbol.replace("frx", "")
+            target_sym = f"frx{clean_symbol}"
+            
+            req = {
+                "ticks_history": target_sym,
+                "adjust_start_time": 1,
+                "count": count,
+                "end": "latest",
+                "granularity": granularity,
+                "style": "candles"
+            }
+            
+            try:
+                self.history_event.clear()
+                self.ws.send(json.dumps(req))
+                if self.history_event.wait(timeout=2.0):
+                    candles = self.history_cache.get(target_sym, [])
+                    results[key] = candles
+                else:
+                    req["ticks_history"] = clean_symbol
+                    self.ws.send(json.dumps(req))
+                    if self.history_event.wait(timeout=2.0):
+                        candles = self.history_cache.get(clean_symbol, [])
+                        results[key] = candles
+                    else:
+                        results[key] = []
+            except Exception as e:
+                logger.error(f"Error fetching history for {symbol}: {e}")
+                results[key] = []
+                
         return results
 
     def register_tick_handler(self, symbol, handler):
@@ -110,12 +146,32 @@ class DerivClient:
                             
                     if self.on_tick_callback:
                         self.on_tick_callback(tick)
+                        
+            elif msg_type == "candles":
+                echo_req = data.get("echo_req", {})
+                sym = echo_req.get("ticks_history")
+                candles_raw = data.get("candles", [])
+                formatted_candles = []
+                for c in candles_raw:
+                    t_val = int(c.get("epoch") or c.get("time") or 0)
+                    formatted_candles.append({
+                        "epoch": t_val,
+                        "time": t_val,
+                        "open": float(c.get("open", 0)),
+                        "high": float(c.get("high", 0)),
+                        "low": float(c.get("low", 0)),
+                        "close": float(c.get("close", 0))
+                    })
+                if sym:
+                    self.history_cache[sym] = formatted_candles
+                self.history_event.set()
                     
             elif msg_type == "error":
                 err = data.get("error", {})
                 err_code = err.get("code")
                 err_msg = err.get("message")
                 logger.warning(f"DerivClient Warning/Error [{err_code}]: {err_msg}")
+                self.history_event.set()
                 
             elif msg_type == "authorize":
                 if data.get("authorize"):

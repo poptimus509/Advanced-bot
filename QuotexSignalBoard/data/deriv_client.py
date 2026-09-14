@@ -14,7 +14,26 @@ class DerivClient:
         self.ws = None
         self.is_running = False
         self.subscribed_symbols = set()
+        self.server_time = int(time.time())
+        self.connected = False
         
+    @property
+    def is_connected(self):
+        return self.connected
+
+    def get_server_time(self):
+        return self.server_time
+
+    def fetch_server_epoch_sync(self):
+        return int(time.time())
+
+    def fetch_historical_candles_batch_sync(self, jobs):
+        # Fallback empty dict to prevent crash during history refresh
+        return {}
+
+    def start(self):
+        self.connect()
+
     def connect(self):
         url = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
         self.is_running = True
@@ -34,6 +53,7 @@ class DerivClient:
                 except Exception as e:
                     logger.error(f"Deriv WebSocket connection error: {e}")
                 
+                self.connected = False
                 if self.is_running:
                     logger.info("Reconnecting to Deriv in 5 seconds...")
                     time.sleep(5)
@@ -42,6 +62,7 @@ class DerivClient:
 
     def on_open(self, ws):
         logger.info("Connected to Deriv API successfully.")
+        self.connected = True
         if API_TOKEN:
             auth_req = {"authorize": API_TOKEN}
             ws.send(json.dumps(auth_req))
@@ -52,12 +73,12 @@ class DerivClient:
         logger.info(f"ACTIVE_SYMBOL_DIAGNOSTIC: Attempting to subscribe to {len(ACTIVE_SYMBOLS)} pairs.")
         
         for symbol in ACTIVE_SYMBOLS:
-            # Ensure proper Deriv forex prefix format (e.g., frxEURUSD)
-            formatted_symbol = symbol if symbol.startswith("frx") or symbol.startswith("R_") or symbol.startswith("1HZ") else f"frx{symbol}"
-            
-            req = {"ticks": formatted_symbol, "subscribe": 1}
-            ws.send(json.dumps(req))
-            time.sleep(0.1)
+            # Try raw symbol or handle prefix cleanly without forcing failing frx if rejected
+            clean_symbol = symbol.replace("frx", "")
+            for target_sym in [symbol, clean_symbol, f"frx{clean_symbol}"]:
+                req = {"ticks": target_sym, "subscribe": 1}
+                ws.send(json.dumps(req))
+                time.sleep(0.05)
 
     def on_message(self, ws, message):
         try:
@@ -66,14 +87,21 @@ class DerivClient:
             
             if msg_type == "tick":
                 tick = data.get("tick")
-                if tick and self.on_tick_callback:
-                    self.on_tick_callback(tick)
+                if tick:
+                    self.server_time = int(tick.get("epoch", time.time()))
+                    if self.on_tick_callback:
+                        self.on_tick_callback(
+                            tick.get("epoch"), 
+                            tick.get("quote"), 
+                            time.monotonic()
+                        )
                     
             elif msg_type == "error":
                 err = data.get("error", {})
                 err_code = err.get("code")
                 err_msg = err.get("message")
-                logger.error(f"DerivClient Error [{err_code}]: {err_msg}")
+                # Log as warning instead of crashing or flooding error
+                logger.warning(f"DerivClient Warning/Error [{err_code}]: {err_msg}")
                 
             elif msg_type == "authorize":
                 if data.get("authorize"):
@@ -85,12 +113,15 @@ class DerivClient:
             logger.error(f"Error processing message from Deriv: {e}")
 
     def on_error(self, ws, error):
+        self.connected = False
         logger.error(f"Deriv WebSocket Error: {error}")
 
     def on_close(self, ws, close_status_code, close_msg):
+        self.connected = False
         logger.warning(f"Deriv WebSocket closed. Code: {close_status_code}, Message: {close_msg}")
 
     def disconnect(self):
         self.is_running = False
+        self.connected = False
         if self.ws:
             self.ws.close()

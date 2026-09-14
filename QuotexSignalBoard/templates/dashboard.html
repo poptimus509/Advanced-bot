@@ -111,7 +111,7 @@
                     
                     const connEl = document.getElementById('connection-status');
                     if (connEl) {
-                        if (data.status === "online" && data.connected) {
+                        if (data.deriv_connected) {
                             connEl.innerText = "Deriv Connected";
                             connEl.className = "status-dot online";
                         } else {

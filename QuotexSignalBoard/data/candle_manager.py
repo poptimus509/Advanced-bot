@@ -125,16 +125,18 @@ class CandleManager:
                 metrics_captured.append(metric)
 
                 df_history_1m = self._build_dataframe("1M")
-                closed_1m_events_to_dispatch.append(
-                    CandleClosedEvent(
-                        symbol=self.symbol,
-                        timeframe="1M",
-                        candle_epoch=prev_1m_candle.epoch,
-                        candle=prev_1m_candle,
-                        server_time_at_close=tick_epoch,
-                        closed_history=df_history_1m
-                    )
+                
+                # FIX: epoch এবং candle_epoch উভয়ই পাস করা হলো যাতে কোনো অ্যাট্রিবিউট মিস না হয়
+                ev_1m = CandleClosedEvent(
+                    symbol=self.symbol,
+                    timeframe="1M",
+                    candle_epoch=prev_1m_candle.epoch,
+                    candle=prev_1m_candle,
+                    server_time_at_close=tick_epoch,
+                    closed_history=df_history_1m
                 )
+                setattr(ev_1m, "epoch", prev_1m_candle.epoch)
+                closed_1m_events_to_dispatch.append(ev_1m)
 
                 for htf in ["5M", "15M"]:
                     htf_sec = TIMEFRAME_SECONDS[htf]
@@ -162,16 +164,16 @@ class CandleManager:
                             self._mtf_1m_buffer[htf] = [c for c in self._mtf_1m_buffer[htf] if c.epoch >= next_1m_boundary]
 
                             df_history_htf = self._build_dataframe(htf)
-                            closed_mtf_events_to_dispatch.append(
-                                CandleClosedEvent(
-                                    symbol=self.symbol,
-                                    timeframe=htf,
-                                    candle_epoch=htf_candle.epoch,
-                                    candle=htf_candle,
-                                    server_time_at_close=tick_epoch,
-                                    closed_history=df_history_htf
-                                )
+                            ev_htf = CandleClosedEvent(
+                                symbol=self.symbol,
+                                timeframe=htf,
+                                candle_epoch=htf_candle.epoch,
+                                candle=htf_candle,
+                                server_time_at_close=tick_epoch,
+                                closed_history=df_history_htf
                             )
+                            setattr(ev_htf, "epoch", htf_candle.epoch)
+                            closed_mtf_events_to_dispatch.append(ev_htf)
 
                 self._forming_candles["1M"] = {
                     "epoch": candle_start,
@@ -188,27 +190,32 @@ class CandleManager:
                 curr_1m["ticks_count"] += 1
 
         for ev in closed_1m_events_to_dispatch:
-            self.dispatcher.dispatch_candle_closed(ev)
+            try:
+                self.dispatcher.dispatch_candle_closed(ev)
+            except Exception as ex:
+                pass
+
         for ev in closed_mtf_events_to_dispatch:
-            self.dispatcher.dispatch_candle_closed(ev)
+            try:
+                self.dispatcher.dispatch_candle_closed(ev)
+            except Exception as ex:
+                pass
 
         return metrics_captured
 
     def _build_dataframe(self, timeframe: str) -> pd.DataFrame:
         candles = list(self._closed_candles[timeframe])
         if not candles:
-            return pd.DataFrame(columns=["Time", "Open", "High", "Low", "Close", "TicksCount"])
+            return pd.DataFrame(columns=["open", "high", "low", "close", "tickscount"])
         data = [{
-            "Time": c.epoch,
-            "Open": c.open,
-            "High": c.high,
-            "Low": c.low,
-            "Close": c.close,
-            "TicksCount": c.ticks_count
+            "time": c.epoch,
+            "open": float(c.open),
+            "high": float(c.high),
+            "low": float(c.low),
+            "close": float(c.close),
+            "tickscount": c.ticks_count
         } for c in candles]
         df = pd.DataFrame(data)
-        for col in ["Open", "High", "Low", "Close"]:
-            df[col] = df[col].astype(float)
         return df
 
     def get_closed_history(self, timeframe: str) -> pd.DataFrame:

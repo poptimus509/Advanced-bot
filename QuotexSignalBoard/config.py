@@ -1,5 +1,8 @@
 import os
 
+# Database Path Configuration
+DB_PATH = os.getenv("DB_PATH", "signals.db")
+
 # Deriv API Configuration
 APP_ID = os.getenv("APP_ID", "1089")
 API_TOKEN = os.getenv("API_TOKEN", "")

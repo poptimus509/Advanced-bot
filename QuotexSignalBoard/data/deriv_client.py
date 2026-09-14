@@ -15,7 +15,6 @@ from config import (
     DERIV_WS_URL,
 )
 
-
 logger = logging.getLogger("DerivClient")
 
 
@@ -89,7 +88,6 @@ class DerivClient:
                 daemon=True,
                 name="DerivSocket",
             )
-
             self._watchdog_thread = threading.Thread(
                 target=self._watchdog_loop,
                 daemon=True,
@@ -104,10 +102,8 @@ class DerivClient:
         self._stop_event.set()
         self.is_connected = False
 
-        socket = self.ws
-
-        if socket is not None:
-            socket.close()
+        if self.ws is not None:
+            self.ws.close()
 
     def get_server_epoch(self) -> int:
         return math.floor(self.get_server_time())
@@ -120,7 +116,6 @@ class DerivClient:
             elapsed = (
                 time.monotonic() - self._server_anchor_monotonic
             )
-
             return self.server_epoch + elapsed
 
     # ========================================================
@@ -167,7 +162,6 @@ class DerivClient:
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
-
                 self.ws = ws
 
                 interval = max(
@@ -181,9 +175,7 @@ class DerivClient:
                 )
 
             except Exception:
-                logger.exception(
-                    "Deriv connection loop failed."
-                )
+                logger.exception("Deriv connection loop failed.")
 
             finally:
                 self.is_connected = False
@@ -201,7 +193,6 @@ class DerivClient:
                     ) >= 60
                 )
 
-            # A socket opening without ticks does not reset backoff.
             if healthy_session:
                 self._backoff = 1
 
@@ -229,7 +220,6 @@ class DerivClient:
 
         with self._state_lock:
             self.is_connected = True
-
             self.connected_at_local = time.time()
             self._connected_monotonic = time.monotonic()
 
@@ -260,12 +250,10 @@ class DerivClient:
         try:
             self._request_server_time(ws)
 
-            # Diagnostic request: discover symbols available to this
-            # connection. Do not guess replacement symbol names.
+            # Discover symbols on the same live connection.
             ws.send(json.dumps({
                 "active_symbols": "brief",
             }))
-
             logger.info("Active-symbol list requested.")
 
             with self._state_lock:
@@ -303,18 +291,59 @@ class DerivClient:
     # ========================================================
 
     def _handle_active_symbols(self, data):
-        symbols = data.get("active_symbols", [])
+        raw_symbols = data.get("active_symbols")
 
-        if not isinstance(symbols, list):
+        # Distinguish an empty list from a missing field,
+        # unexpected response shape, or invalid list entries.
+        logger.info(
+            "ACTIVE_SYMBOL_DIAGNOSTIC %s",
+            json.dumps(
+                {
+                    "response_keys": sorted(data.keys()),
+                    "msg_type": data.get("msg_type"),
+                    "field_present": "active_symbols" in data,
+                    "field_type": type(raw_symbols).__name__,
+                    "raw_count": (
+                        len(raw_symbols)
+                        if isinstance(raw_symbols, list)
+                        else None
+                    ),
+                    "sample": (
+                        raw_symbols[:2]
+                        if isinstance(raw_symbols, list)
+                        else None
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+        if "active_symbols" not in data:
             logger.error(
-                "Unexpected active_symbols response format."
+                "ACTIVE_SYMBOL_FIELD_MISSING: "
+                "response does not contain active_symbols."
+            )
+            return
+
+        if not isinstance(raw_symbols, list):
+            logger.error(
+                "ACTIVE_SYMBOL_FORMAT_ERROR: expected list, got %s.",
+                type(raw_symbols).__name__,
             )
             return
 
         symbols = [
-            item for item in symbols
+            item for item in raw_symbols
             if isinstance(item, dict)
         ]
+
+        invalid_items = len(raw_symbols) - len(symbols)
+
+        if invalid_items:
+            logger.warning(
+                "ACTIVE_SYMBOL_INVALID_ITEMS=%s",
+                invalid_items,
+            )
 
         with self._state_lock:
             self.active_symbols = symbols
@@ -324,6 +353,13 @@ class DerivClient:
             "ACTIVE_SYMBOL_COUNT=%s",
             len(symbols),
         )
+
+        if not raw_symbols:
+            logger.warning(
+                "ACTIVE_SYMBOL_LIST_EMPTY: "
+                "Deriv returned an empty active_symbols list "
+                "on this connection."
+            )
 
         available_codes = set()
 
@@ -343,8 +379,8 @@ class DerivClient:
                 item.get("is_trading_suspended"),
             )
 
-        missing = sorted(requested - available_codes)
         present = sorted(requested & available_codes)
+        missing = sorted(requested - available_codes)
 
         logger.info(
             "CONFIGURED_SYMBOLS_PRESENT=%s",
@@ -357,8 +393,8 @@ class DerivClient:
                 missing,
             )
 
-        # Being listed does not by itself prove live tick availability.
-        # FIRST_TICK logs provide that evidence.
+        # No automatic symbol substitution.
+        # FIRST_TICK is evidence of actual live tick reception.
 
     # ========================================================
     # MESSAGE PROCESSING
@@ -434,8 +470,7 @@ class DerivClient:
 
                     if round_trip > 5:
                         logger.warning(
-                            "Ignoring delayed server-time "
-                            "response: %.2fs",
+                            "Ignoring delayed server-time response: %.2fs",
                             round_trip,
                         )
                         return
@@ -488,7 +523,7 @@ class DerivClient:
                         quote,
                     )
 
-                # Do not adjust the server clock from tick timestamps.
+                # Tick timestamps must not reset the server clock.
                 if handler:
                     try:
                         handler(
@@ -506,7 +541,6 @@ class DerivClient:
                             self._last_handler_error[symbol] = (
                                 receipt_mono
                             )
-
                             logger.exception(
                                 "TICK_HANDLER_ERROR symbol=%s",
                                 symbol,
@@ -519,7 +553,6 @@ class DerivClient:
                 symbol = str(
                     request.get("ticks_history", "")
                 )
-
                 callback = self._history_callbacks.get(symbol)
 
                 if callback:
@@ -569,7 +602,6 @@ class DerivClient:
                         self._last_tick_monotonic
                         or self._connected_monotonic
                     )
-
                     rejected = dict(self._subscription_errors)
                     total = len(self._tick_subscribers)
                     received_count = len(self._received_symbols)
@@ -578,14 +610,15 @@ class DerivClient:
                     continue
 
                 if total and len(rejected) == total:
-                    # Keep API errors visible instead of reconnecting
-                    # continuously to the same rejected symbols.
+                    # Reconnecting repeatedly cannot correct invalid
+                    # configured symbol names.
                     if now - self._last_rejection_summary >= 30:
                         self._last_rejection_summary = now
 
                         logger.error(
                             "All tick subscriptions rejected: %s. "
-                            "Check AVAILABLE_SYMBOL logs.",
+                            "Check ACTIVE_SYMBOL_DIAGNOSTIC "
+                            "and AVAILABLE_SYMBOL logs.",
                             rejected,
                         )
 
@@ -598,13 +631,10 @@ class DerivClient:
                     received_count,
                     rejected,
                 )
-
                 ws.close()
 
             except Exception:
-                logger.exception(
-                    "Deriv watchdog failed."
-                )
+                logger.exception("Deriv watchdog failed.")
 
                 if ws is self.ws:
                     ws.close()
@@ -720,7 +750,6 @@ class DerivClient:
 
                 try:
                     payload = json.loads(socket.recv())
-
                 except websocket.WebSocketTimeoutException:
                     continue
 

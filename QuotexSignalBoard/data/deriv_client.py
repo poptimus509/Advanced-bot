@@ -45,10 +45,14 @@ class DerivClient:
             self.ws.close()
 
     def get_server_epoch(self) -> int:
+        return math.floor(self.get_server_time())
+
+    def get_server_time(self) -> float:
+        """Return Deriv-aligned time with sub-second precision."""
         if self.server_epoch == 0:
-            return math.floor(time.time())
+            return time.time()
         elapsed = time.time() - self.server_epoch_local_time
-        return math.floor(self.server_epoch + elapsed)
+        return self.server_epoch + elapsed
 
     def _run_loop(self):
         logger.info("=== Deriv WebSocket background thread loop started ===")

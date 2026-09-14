@@ -2,13 +2,13 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# INDICATORS
+# TECHNICAL INDICATORS
 # ============================================================
 
-def calculate_ema(series, period):
+def calculate_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
-def calculate_rsi(series, period=14):
+def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -23,7 +23,7 @@ def calculate_rsi(series, period=14):
     rsi = rsi.where(avg_gain != 0, 0)
     return rsi
 
-def calculate_macd(series, fast=12, slow=26, signal=9):
+def calculate_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
     exp_fast = series.ewm(span=fast, adjust=False).mean()
     exp_slow = series.ewm(span=slow, adjust=False).mean()
 
@@ -32,7 +32,7 @@ def calculate_macd(series, fast=12, slow=26, signal=9):
     histogram = macd_line - signal_line
     return macd_line, signal_line, histogram
 
-def calculate_adx(df, period=14):
+def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     if df is None or len(df) < period + 1:
         return pd.Series(25.0, index=df.index if df is not None else [])
 
@@ -62,7 +62,7 @@ def calculate_adx(df, period=14):
     adx = dx.rolling(window=period, min_periods=period).mean()
     return adx.fillna(25.0)
 
-def calculate_directional_strength(df, period=14):
+def calculate_directional_strength(df: pd.DataFrame, period: int = 14):
     if df is None or len(df) < period + 1:
         return 0.0, 0.0, "NEUTRAL"
 
@@ -99,10 +99,10 @@ def calculate_directional_strength(df, period=14):
     return plus_di, minus_di, direction
 
 # ============================================================
-# MARKET STRUCTURE & CANDLESTICK
+# MARKET STRUCTURE & CANDLESTICK DYNAMICS
 # ============================================================
 
-def detect_bos(df, lookback=5):
+def detect_bos(df: pd.DataFrame, lookback: int = 5) -> str:
     if df is None or len(df) < lookback + 1:
         return "NEUTRAL"
 
@@ -116,7 +116,7 @@ def detect_bos(df, lookback=5):
         return "BEARISH_BOS"
     return "NEUTRAL"
 
-def detect_candlestick_pattern(df):
+def detect_candlestick_pattern(df: pd.DataFrame) -> str:
     if df is None or len(df) < 2:
         return "NEUTRAL"
 
@@ -140,7 +140,7 @@ def detect_candlestick_pattern(df):
     bullish = close > open_price
     bearish = close < open_price
 
-    # Solid breakout momentum
+    # Solid Momentum Breakout
     if bullish and body_ratio >= 0.50 and close >= float(prev["high"]):
         return "BULLISH"
     if bearish and body_ratio >= 0.50 and close <= float(prev["low"]):
@@ -152,7 +152,7 @@ def detect_candlestick_pattern(df):
     if bearish and upper_wick >= body * 1.3 and upper_wick > lower_wick:
         return "BEARISH"
 
-    # Engulfing pattern
+    # Engulfing Setup
     prev_open = float(prev["open"])
     prev_close = float(prev["close"])
     if bullish and prev_close < prev_open and close >= prev_open:
@@ -162,7 +162,7 @@ def detect_candlestick_pattern(df):
 
     return "NEUTRAL"
 
-def _get_epoch(index_value):
+def _get_epoch(index_value) -> int:
     try:
         if hasattr(index_value, "timestamp"):
             return int(index_value.timestamp())
@@ -171,10 +171,10 @@ def _get_epoch(index_value):
         return 0
 
 # ============================================================
-# MAIN STRATEGY
+# CORE STRATEGY EVALUATION
 # ============================================================
 
-def evaluate_strategy(df_1m, df_5m, df_15m):
+def evaluate_strategy(df_1m: pd.DataFrame, df_5m: pd.DataFrame, df_15m: pd.DataFrame):
     details = {
         "bias": "NEUTRAL",
         "trend": "NEUTRAL",
@@ -182,7 +182,7 @@ def evaluate_strategy(df_1m, df_5m, df_15m):
         "pa": "NEUTRAL",
         "score_reason": "",
         "signal_candle_epoch": None,
-        "threshold_used": 7,
+        "threshold_used": 8,
         "timeframe_alignment": "NEUTRAL",
         "adx_5m": 0.0,
         "rsi_1m": 50.0,
@@ -201,7 +201,7 @@ def evaluate_strategy(df_1m, df_5m, df_15m):
     latest_1m = df_1m.iloc[-1]
     details["signal_candle_epoch"] = _get_epoch(latest_1m.name)
 
-    # 1. 15M BIAS (+1)
+    # 1. 15M Macro Context (+1 point)
     bias_15m = "NEUTRAL"
     if df_15m is not None and len(df_15m) >= 15:
         close_15m = float(df_15m["close"].iloc[-1])
@@ -213,7 +213,7 @@ def evaluate_strategy(df_1m, df_5m, df_15m):
                 bias_15m = "BEARISH"
     details["bias"] = bias_15m
 
-    # 2. 5M DIRECTION (+2)
+    # 2. 5M Structural Trend (+2 points)
     ema20_5m = float(calculate_ema(df_5m["close"], 20).iloc[-1])
     ema50_5m = float(calculate_ema(df_5m["close"], 50).iloc[-1])
     structure_5m = detect_bos(df_5m, lookback=5)
@@ -232,7 +232,7 @@ def evaluate_strategy(df_1m, df_5m, df_15m):
         trend_5m = "NEUTRAL"
     details["trend"] = trend_5m
 
-    # 3. 1M ENTRY INDICATORS
+    # 3. 1M Entry Momentum (+5 points total across indicators)
     ema9_1m = float(calculate_ema(df_1m["close"], 9).iloc[-1])
     ema21_1m = float(calculate_ema(df_1m["close"], 21).iloc[-1])
     rsi_series = calculate_rsi(df_1m["close"], 14)
@@ -242,14 +242,15 @@ def evaluate_strategy(df_1m, df_5m, df_15m):
     _, _, macd_hist = calculate_macd(df_1m["close"])
     curr_hist = float(macd_hist.iloc[-1])
     prev_hist = float(macd_hist.iloc[-2])
+
     pa_1m = detect_candlestick_pattern(df_1m)
     details["pa"] = pa_1m
 
-    # 1M EMA (+2)
+    # 1M EMA (+2 points)
     ema_direction = "BULLISH" if ema9_1m > ema21_1m else ("BEARISH" if ema9_1m < ema21_1m else "NEUTRAL")
     details["ema_alignment"] = ema_direction
 
-    # MACD (+1)
+    # MACD (+1 point)
     if curr_hist > 0 and curr_hist >= prev_hist:
         macd_direction = "BULLISH"
     elif curr_hist < 0 and curr_hist <= prev_hist:
@@ -258,7 +259,7 @@ def evaluate_strategy(df_1m, df_5m, df_15m):
         macd_direction = "NEUTRAL"
     details["macd_momentum"] = macd_direction
 
-    # 4. SCORING
+    # 4. Point Scoring Engine
     call_score, put_score = 0, 0
     call_reasons, put_reasons = [], []
 
@@ -311,7 +312,7 @@ def evaluate_strategy(df_1m, df_5m, df_15m):
         put_score += 1
         put_reasons.append("MACD Bearish")
 
-    # 1M Price Action (+2)
+    # 1M Price Action (+2 points)
     if pa_1m == "BULLISH":
         call_score += 2
         call_reasons.append("1M PA Bullish")
@@ -319,7 +320,7 @@ def evaluate_strategy(df_1m, df_5m, df_15m):
         put_score += 2
         put_reasons.append("1M PA Bearish")
 
-    # 5. DETERMINE DIRECTION & THRESHOLD
+    # 5. Determine Primary Direction
     if call_score > put_score:
         direction = "CALL"
         final_score = call_score
@@ -332,15 +333,26 @@ def evaluate_strategy(df_1m, df_5m, df_15m):
         details["score_reason"] = f"Equal: CALL={call_score}, PUT={put_score}"
         return ("NO_TRADE", max(call_score, put_score), "NO_TRADE", details)
 
-    # হাই-অ্যাকিউরেসি ফিল্টারিংয়ের জন্য থ্রেশহোল্ড ৭
-    threshold = 7
+    # --------------------------------------------------------
+    # STRICT FILTER: REJECT OPPOSING CANDLE MOMENTUM
+    # --------------------------------------------------------
+    if direction == "CALL" and pa_1m == "BEARISH":
+        details["score_reason"] = "Rejected: CALL setup opposed by Bearish 1M price action."
+        return ("NO_TRADE", final_score, "CONTRADICTING_PA", details)
+
+    if direction == "PUT" and pa_1m == "BULLISH":
+        details["score_reason"] = "Rejected: PUT setup opposed by Bullish 1M price action."
+        return ("NO_TRADE", final_score, "CONTRADICTING_PA", details)
+
+    # High quality execution threshold: 8 out of 10
+    threshold = 8
     details["threshold_used"] = threshold
 
     if final_score < threshold:
-        details["score_reason"] = f"{direction} score {final_score}/10 below threshold {threshold}"
+        details["score_reason"] = f"{direction} score {final_score}/10 below strict threshold {threshold}"
         return ("NO_TRADE", final_score, "LOW_SCORE", details)
 
-    quality = "A+" if final_score >= 9 else ("A" if final_score >= 8 else "B+")
+    quality = "A+" if final_score >= 9 else "A"
     details["score_reason"] = f"{direction} {final_score}/10 | " + ", ".join(reasons)
 
     return (direction, final_score, quality, details)

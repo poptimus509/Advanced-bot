@@ -1,5 +1,19 @@
 import numpy as np
 import pandas as pd
+from config import (
+    MIN_1M_HISTORY,
+    MIN_5M_HISTORY,
+    MIN_15M_HISTORY,
+    MIN_ADX_5M,
+    REQUIRE_15M_ALIGNMENT,
+    REQUIRE_5M_1M_ALIGNMENT,
+    REQUIRE_CURRENT_CANDLE_CONFIRMATION,
+    RSI_CALL_MAX,
+    RSI_CALL_MIN,
+    RSI_PUT_MAX,
+    RSI_PUT_MIN,
+    SIGNAL_THRESHOLD_CALL_PUT,
+)
 
 # ============================================================
 # TECHNICAL INDICATORS
@@ -33,8 +47,10 @@ def calculate_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: in
     return macd_line, signal_line, histogram
 
 def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    if df is None or len(df) < period + 1:
-        return pd.Series(25.0, index=df.index if df is not None else [])
+    # ADX needs roughly two full smoothing windows. Never manufacture trend
+    # strength when the history is not mature enough.
+    if df is None or len(df) < (period * 2):
+        return pd.Series(np.nan, index=df.index if df is not None else [], dtype=float)
 
     high = df["high"].astype(float)
     low = df["low"].astype(float)
@@ -60,7 +76,7 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     dx = 100 * (plus_di_series - minus_di_series).abs() / di_sum
 
     adx = dx.rolling(window=period, min_periods=period).mean()
-    return adx.fillna(25.0)
+    return adx
 
 def calculate_directional_strength(df: pd.DataFrame, period: int = 14):
     if df is None or len(df) < period + 1:
@@ -182,15 +198,26 @@ def evaluate_strategy(df_1m: pd.DataFrame, df_5m: pd.DataFrame, df_15m: pd.DataF
         "pa": "NEUTRAL",
         "score_reason": "",
         "signal_candle_epoch": None,
-        "threshold_used": 8,
+        "threshold_used": SIGNAL_THRESHOLD_CALL_PUT,
         "timeframe_alignment": "NEUTRAL",
         "adx_5m": 0.0,
         "rsi_1m": 50.0,
         "macd_momentum": "NEUTRAL",
-        "ema_alignment": "NEUTRAL"
+        "ema_alignment": "NEUTRAL",
+        "candle_flow": "NEUTRAL",
+        "alignment_score": 0,
+        "momentum_strength": 0.0,
+        "ema_spread_pct": 0.0,
+        "call_score": 0,
+        "put_score": 0,
     }
 
-    if df_1m is None or df_5m is None or len(df_1m) < 25 or len(df_5m) < 20:
+    if (
+        df_1m is None or df_5m is None or df_15m is None
+        or len(df_1m) < MIN_1M_HISTORY
+        or len(df_5m) < MIN_5M_HISTORY
+        or len(df_15m) < MIN_15M_HISTORY
+    ):
         return ("NO_TRADE", 0, "INSUFFICIENT_DATA", details)
 
     df_1m.columns = [str(col).lower() for col in df_1m.columns]
@@ -203,7 +230,7 @@ def evaluate_strategy(df_1m: pd.DataFrame, df_5m: pd.DataFrame, df_15m: pd.DataF
 
     # 1. 15M Macro Context (+1 point)
     bias_15m = "NEUTRAL"
-    if df_15m is not None and len(df_15m) >= 15:
+    if df_15m is not None and len(df_15m) >= MIN_15M_HISTORY:
         close_15m = float(df_15m["close"].iloc[-1])
         ema20_15m = float(calculate_ema(df_15m["close"], 20).iloc[-1])
         if ema20_15m != 0:
@@ -220,7 +247,7 @@ def evaluate_strategy(df_1m: pd.DataFrame, df_5m: pd.DataFrame, df_15m: pd.DataF
     details["structure"] = structure_5m
 
     adx_series = calculate_adx(df_5m, period=14)
-    adx_5m = float(adx_series.iloc[-1]) if not pd.isna(adx_series.iloc[-1]) else 25.0
+    adx_5m = float(adx_series.iloc[-1]) if not pd.isna(adx_series.iloc[-1]) else 0.0
     plus_di, minus_di, di_direction = calculate_directional_strength(df_5m, period=14)
     details["adx_5m"] = round(adx_5m, 2)
 
@@ -249,6 +276,8 @@ def evaluate_strategy(df_1m: pd.DataFrame, df_5m: pd.DataFrame, df_15m: pd.DataF
     # 1M EMA (+2 points)
     ema_direction = "BULLISH" if ema9_1m > ema21_1m else ("BEARISH" if ema9_1m < ema21_1m else "NEUTRAL")
     details["ema_alignment"] = ema_direction
+    ema_base = abs(float(df_1m["close"].iloc[-1])) or 1.0
+    details["ema_spread_pct"] = round(abs(ema9_1m - ema21_1m) / ema_base * 100.0, 6)
 
     # MACD (+1 point)
     if curr_hist > 0 and curr_hist >= prev_hist:
@@ -258,6 +287,17 @@ def evaluate_strategy(df_1m: pd.DataFrame, df_5m: pd.DataFrame, df_15m: pd.DataF
     else:
         macd_direction = "NEUTRAL"
     details["macd_momentum"] = macd_direction
+    details["momentum_strength"] = round(abs(curr_hist - prev_hist), 10)
+
+    latest_open = float(latest_1m["open"])
+    latest_close = float(latest_1m["close"])
+    if latest_close > latest_open:
+        candle_flow = "BULLISH"
+    elif latest_close < latest_open:
+        candle_flow = "BEARISH"
+    else:
+        candle_flow = "NEUTRAL"
+    details["candle_flow"] = candle_flow
 
     # 4. Point Scoring Engine
     call_score, put_score = 0, 0
@@ -280,7 +320,7 @@ def evaluate_strategy(df_1m: pd.DataFrame, df_5m: pd.DataFrame, df_15m: pd.DataF
         put_reasons.append("5M Trend Bearish")
 
     # 5M ADX/DI (+1)
-    if adx_5m >= 18:
+    if adx_5m >= MIN_ADX_5M:
         if di_direction == "BULLISH":
             call_score += 1
             call_reasons.append("5M DI+ Bullish")
@@ -297,10 +337,10 @@ def evaluate_strategy(df_1m: pd.DataFrame, df_5m: pd.DataFrame, df_15m: pd.DataF
         put_reasons.append("1M EMA9<21")
 
     # 1M RSI (+1)
-    if 48 <= rsi_14_1m <= 75:
+    if RSI_CALL_MIN <= rsi_14_1m <= RSI_CALL_MAX:
         call_score += 1
         call_reasons.append(f"RSI Bullish ({rsi_14_1m:.0f})")
-    elif 25 <= rsi_14_1m <= 52:
+    elif RSI_PUT_MIN <= rsi_14_1m <= RSI_PUT_MAX:
         put_score += 1
         put_reasons.append(f"RSI Bearish ({rsi_14_1m:.0f})")
 
@@ -319,6 +359,9 @@ def evaluate_strategy(df_1m: pd.DataFrame, df_5m: pd.DataFrame, df_15m: pd.DataF
     elif pa_1m == "BEARISH":
         put_score += 2
         put_reasons.append("1M PA Bearish")
+
+    details["call_score"] = call_score
+    details["put_score"] = put_score
 
     # 5. Determine Primary Direction
     if call_score > put_score:
@@ -344,8 +387,36 @@ def evaluate_strategy(df_1m: pd.DataFrame, df_5m: pd.DataFrame, df_15m: pd.DataF
         details["score_reason"] = "Rejected: PUT setup opposed by Bullish 1M price action."
         return ("NO_TRADE", final_score, "CONTRADICTING_PA", details)
 
+    # 15M is a soft macro bias. The execution gate is built from the 5M
+    # structural trend and the 1M EMA/MACD entry momentum.
+    expected = "BULLISH" if direction == "CALL" else "BEARISH"
+    alignment_components = [bias_15m, trend_5m, ema_direction, macd_direction]
+    details["alignment_score"] = sum(value == expected for value in alignment_components)
+
+    if REQUIRE_15M_ALIGNMENT and bias_15m != expected:
+        details["score_reason"] = (
+            f"Rejected: {direction} conflicts with 15M bias ({bias_15m})."
+        )
+        return ("NO_TRADE", final_score, "15M_MISALIGNMENT", details)
+
+    entry_alignment = [trend_5m, ema_direction, macd_direction]
+    if REQUIRE_5M_1M_ALIGNMENT and any(value != expected for value in entry_alignment):
+        details["score_reason"] = (
+            f"Rejected: {direction} is not aligned across 5M/1M/MACD "
+            f"({trend_5m}, {ema_direction}, {macd_direction}); 15M bias={bias_15m}."
+        )
+        return ("NO_TRADE", final_score, "ENTRY_TIMEFRAME_MISALIGNMENT", details)
+
+    if REQUIRE_CURRENT_CANDLE_CONFIRMATION and candle_flow != expected:
+        details["score_reason"] = f"Rejected: latest closed 1M candle is {candle_flow}."
+        return ("NO_TRADE", final_score, "CANDLE_NOT_CONFIRMED", details)
+
+    if adx_5m < MIN_ADX_5M:
+        details["score_reason"] = f"Rejected: 5M ADX {adx_5m:.2f} is below {MIN_ADX_5M:.2f}."
+        return ("NO_TRADE", final_score, "WEAK_TREND", details)
+
     # High quality execution threshold: 8 out of 10
-    threshold = 8
+    threshold = SIGNAL_THRESHOLD_CALL_PUT
     details["threshold_used"] = threshold
 
     if final_score < threshold:

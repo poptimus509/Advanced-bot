@@ -77,7 +77,7 @@ class DerivClient:
         
         for symbol in ACTIVE_SYMBOLS:
             clean_symbol = symbol.replace("frx", "")
-            for target_sym in [symbol, clean_symbol, f"frx{clean_symbol}"]:
+            for target_sym in [f"frx{clean_symbol}", clean_symbol]:
                 req = {"ticks": target_sym, "subscribe": 1}
                 ws.send(json.dumps(req))
                 time.sleep(0.05)
@@ -96,7 +96,6 @@ class DerivClient:
                     
                     self.server_time = epoch
                     
-                    # Call specific registered handler if available
                     if symbol in self.tick_handlers:
                         try:
                             self.tick_handlers[symbol](epoch, quote, time.monotonic())

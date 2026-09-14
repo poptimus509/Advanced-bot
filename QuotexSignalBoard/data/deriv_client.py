@@ -16,6 +16,7 @@ class DerivClient:
         self.subscribed_symbols = set()
         self.server_time = int(time.time())
         self.connected = False
+        self.tick_handlers = {}
         
     @property
     def is_connected(self):
@@ -29,6 +30,9 @@ class DerivClient:
 
     def fetch_historical_candles_batch_sync(self, jobs):
         return {}
+
+    def register_tick_handler(self, symbol, handler):
+        self.tick_handlers[symbol] = handler
 
     def start(self):
         self.connect()
@@ -86,13 +90,21 @@ class DerivClient:
             if msg_type == "tick":
                 tick = data.get("tick")
                 if tick:
-                    self.server_time = int(tick.get("epoch", time.time()))
+                    symbol = tick.get("symbol")
+                    epoch = int(tick.get("epoch", time.time()))
+                    quote = float(tick.get("quote", 0))
+                    
+                    self.server_time = epoch
+                    
+                    # Call specific registered handler if available
+                    if symbol in self.tick_handlers:
+                        try:
+                            self.tick_handlers[symbol](epoch, quote, time.monotonic())
+                        except Exception as e:
+                            logger.error(f"Error in tick handler for {symbol}: {e}")
+                            
                     if self.on_tick_callback:
-                        self.on_tick_callback(
-                            tick.get("epoch"), 
-                            tick.get("quote"), 
-                            time.monotonic()
-                        )
+                        self.on_tick_callback(tick)
                     
             elif msg_type == "error":
                 err = data.get("error", {})

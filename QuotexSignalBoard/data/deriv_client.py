@@ -52,7 +52,10 @@ class DerivClient:
         logger.info(f"ACTIVE_SYMBOL_DIAGNOSTIC: Attempting to subscribe to {len(ACTIVE_SYMBOLS)} pairs.")
         
         for symbol in ACTIVE_SYMBOLS:
-            req = {"ticks": symbol, "subscribe": 1}
+            # Ensure proper Deriv forex prefix format (e.g., frxEURUSD)
+            formatted_symbol = symbol if symbol.startswith("frx") or symbol.startswith("R_") or symbol.startswith("1HZ") else f"frx{symbol}"
+            
+            req = {"ticks": formatted_symbol, "subscribe": 1}
             ws.send(json.dumps(req))
             time.sleep(0.1)
 

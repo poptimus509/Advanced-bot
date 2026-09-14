@@ -205,56 +205,55 @@ def make_tick_handler(symbol, manager):
             monotonic_now = time.monotonic()
             boundary = epoch // 60 * 60
 
+            clean_sym = symbol.replace("frx", "")
+
             with state_lock:
-                previous = live_state.get(symbol)
+                for target_key in [symbol, clean_sym, f"frx{clean_sym}"]:
+                    previous = live_state.get(target_key)
 
-                if previous and epoch < previous["epoch"]:
-                    return []
+                    if previous and epoch < previous["epoch"]:
+                        continue
 
-                windows = tick_windows[symbol]
-                window = windows.get(boundary)
+                    windows = tick_windows.setdefault(target_key, {})
+                    window = windows.get(boundary)
 
-                if window is None:
-                    window = {
-                        "count": 0,
-                        "first": epoch,
-                        "last": epoch,
-                        "last_receipt": monotonic_now,
-                        "complete": epoch - boundary <= 3,
+                    if window is None:
+                        window = {
+                            "count": 0,
+                            "first": epoch,
+                            "last": epoch,
+                            "last_receipt": monotonic_now,
+                            "complete": epoch - boundary <= 3,
+                        }
+                        windows[boundary] = window
+
+                    elif (
+                        epoch - window["last"] > cfg.STALE_TICK_THRESHOLD_SEC
+                        or monotonic_now - window["last_receipt"] > cfg.STALE_TICK_THRESHOLD_SEC
+                    ):
+                        window["complete"] = False
+
+                    window["count"] += 1
+                    window["last"] = epoch
+                    window["last_receipt"] = monotonic_now
+
+                    live_state[target_key] = {
+                        "epoch": epoch,
+                        "price": price,
+                        "receipt": monotonic_now,
                     }
-                    windows[boundary] = window
 
-                elif (
-                    epoch - window["last"]
-                    > cfg.STALE_TICK_THRESHOLD_SEC
-                    or monotonic_now - window["last_receipt"]
-                    > cfg.STALE_TICK_THRESHOLD_SEC
-                ):
-                    window["complete"] = False
+                    oldest_allowed = boundary - cfg.CANDLE_HISTORY_LIMIT * 60
 
-                window["count"] += 1
-                window["last"] = epoch
-                window["last_receipt"] = monotonic_now
+                    for old_epoch in list(windows):
+                        if old_epoch < oldest_allowed:
+                            del windows[old_epoch]
 
-                live_state[symbol] = {
-                    "epoch": epoch,
-                    "price": price,
-                    "receipt": monotonic_now,
-                }
-
-                oldest_allowed = (
-                    boundary - cfg.CANDLE_HISTORY_LIMIT * 60
-                )
-
-                for old_epoch in list(windows):
-                    if old_epoch < oldest_allowed:
-                        del windows[old_epoch]
-
-                return manager.process_tick(
-                    epoch,
-                    price,
-                    receipt_time,
-                )
+            return manager.process_tick(
+                epoch,
+                price,
+                receipt_time,
+            )
 
         except Exception:
             logger.exception(
@@ -274,16 +273,19 @@ for symbol in cfg.FOREX_PAIRS:
 
     candle_managers[symbol] = manager
     tick_windows[symbol] = {}
+    tick_windows[symbol.replace("frx", "")] = {}
+    tick_windows[f"frx{symbol.replace('frx', '')}"] = {}
 
-    deriv_client.register_tick_handler(
-        symbol,
-        make_tick_handler(symbol, manager),
-    )
+    handler = make_tick_handler(symbol, manager)
+    deriv_client.register_tick_handler(symbol, handler)
+    deriv_client.register_tick_handler(symbol.replace("frx", ""), handler)
+    deriv_client.register_tick_handler(f"frx{symbol.replace('frx', '')}", handler)
 
 
 def live_quote(symbol):
     with state_lock:
-        quote = live_state.get(symbol)
+        clean = symbol.replace("frx", "")
+        quote = live_state.get(symbol) or live_state.get(clean) or live_state.get(f"frx{clean}")
 
         if quote is None:
             return None
@@ -316,9 +318,12 @@ def history_snapshot(symbol):
             "1M"
         ).copy()
 
+        clean = symbol.replace("frx", "")
+        symbol_windows = tick_windows.get(symbol) or tick_windows.get(clean) or tick_windows.get(f"frx{clean}", {})
+
         windows = {
             epoch: dict(value)
-            for epoch, value in tick_windows[symbol].items()
+            for epoch, value in symbol_windows.items()
         }
 
     if "time" not in df.columns:
@@ -345,7 +350,8 @@ def history_snapshot(symbol):
 
 def feed_diagnostics(symbol):
     with state_lock:
-        quote = live_state.get(symbol)
+        clean = symbol.replace("frx", "")
+        quote = live_state.get(symbol) or live_state.get(clean) or live_state.get(f"frx{clean}")
         quote = dict(quote) if quote else None
 
         candle = candle_managers[
@@ -494,7 +500,7 @@ def save_signal(candidate, target_epoch, entry_price):
             )
             VALUES (
                 ?, ?, ?, '1M', ?, ?, ?, ?, ?, ?, 'NOT_USED',
-                ?, ?, 'PENDING', ?
+                ?, ?, ?, 'PENDING', ?
             )
             """,
             (

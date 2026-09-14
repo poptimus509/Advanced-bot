@@ -1,6 +1,5 @@
 import datetime
 import logging
-import math
 import os
 import threading
 import time
@@ -49,7 +48,7 @@ app = Flask(__name__)
 init_db()
 
 # ============================================================
-# GLOBAL STATE & CACHE CONTROLS
+# GLOBAL STATE & CACHE LOCKS
 # ============================================================
 
 latest_evaluations = {}
@@ -207,36 +206,25 @@ def send_pusher_signal(display_name, direction, score, quality, bias, timeframe,
         logger.error(f"Pusher dispatch error: {e}")
 
 # ============================================================
-# SIGNAL VALIDATION & RATE CONTROL
+# SIGNAL DISPATCHER
 # ============================================================
 
-def process_signal_if_strong(
-    symbol, display_name, timeframe, direction,
-    score, quality, details, entry_price, target_epoch
-):
-    if direction not in ("CALL", "PUT"):
-        return
-
-    # Strictly permit a maximum of 1 signal across all pairs per target minute
-    with cache_lock:
-        if target_epoch in processed_target_minutes:
-            return
-
-    try:
-        threshold = int(SIGNAL_THRESHOLD_CALL_PUT)
-    except Exception:
-        threshold = 7
-
-    if threshold < 1:
-        threshold = 7
-
-    if score < threshold:
-        return
+def dispatch_best_signal(candidate, target_epoch):
+    symbol = candidate["symbol"]
+    display_name = candidate["display_name"]
+    timeframe = "1M"
+    direction = candidate["direction"]
+    score = candidate["score"]
+    quality = candidate["quality"]
+    details = candidate["details"]
+    entry_price = candidate["entry_price"]
 
     target_key = f"{symbol}_{timeframe}_{target_epoch}"
     signal_key = f"{symbol}_{timeframe}_{target_epoch}_{direction}"
 
     with cache_lock:
+        if target_epoch in processed_target_minutes:
+            return
         if target_key in target_signal_cache or signal_key in sent_telegram_cache:
             return
 
@@ -248,21 +236,21 @@ def process_signal_if_strong(
     bias = details.get("bias", "NEUTRAL")
     pa = details.get("pa", "")
 
-    # Non-blocking Telegram alert
+    # Non-blocking Telegram notification
     threading.Thread(
         target=send_telegram_alert,
         args=(display_name, direction, score, quality, bias, pa, timeframe, target_epoch),
         daemon=True
     ).start()
 
-    # Non-blocking Pusher alert
+    # Non-blocking Pusher notification
     threading.Thread(
         target=send_pusher_signal,
         args=(display_name, direction, score, quality, bias, timeframe, target_epoch),
         daemon=True
     ).start()
 
-    # Async database commit
+    # Asynchronous database save
     save_signal_to_db_async(
         signal_id=signal_id,
         symbol=symbol,
@@ -277,11 +265,11 @@ def process_signal_if_strong(
     )
 
     logger.info(
-        f"PERFECT 0-SEC ENTRY SIGNAL: {display_name} | {direction} | Score={score}/10 | Target={target_epoch}"
+        f"HIGH-ACCURACY BEST SIGNAL: {display_name} | {direction} | Score={score}/10 | Target={target_epoch}"
     )
 
 # ============================================================
-# STRATEGY EVALUATION
+# PAIR EVALUATION
 # ============================================================
 
 def evaluate_pair(symbol, display_name, target_epoch):
@@ -312,6 +300,8 @@ def evaluate_pair(symbol, display_name, target_epoch):
         entry_price = float(latest_closed.close)
 
         return {
+            "symbol": symbol,
+            "display_name": display_name,
             "direction": direction,
             "score": int(score),
             "quality": quality,
@@ -321,11 +311,11 @@ def evaluate_pair(symbol, display_name, target_epoch):
             "entry_price": entry_price
         }
     except Exception as e:
-        logger.error(f"Strategy evaluation error for {display_name}: {e}")
+        logger.error(f"Evaluation error for {display_name}: {e}")
         return None
 
 # ============================================================
-# EVALUATION & DISPATCH PIPELINE
+# SCAN ALL PAIRS & SELECT THE SINGLE BEST CANDIDATE
 # ============================================================
 
 def evaluate_and_dispatch_all(send_signal=True, target_epoch=None):
@@ -337,6 +327,8 @@ def evaluate_and_dispatch_all(send_signal=True, target_epoch=None):
         if target_epoch is None:
             target_epoch = (int(now_ts // 60) + 1) * 60
 
+        eligible_candidates = []
+
         for sym, disp in FOREX_PAIRS.items():
             result = evaluate_pair(sym, disp, target_epoch)
             if not result:
@@ -346,7 +338,6 @@ def evaluate_and_dispatch_all(send_signal=True, target_epoch=None):
             score = result["score"]
             quality = result["quality"]
             details = result["details"]
-            entry_price = result["entry_price"]
 
             latest_evaluations[disp] = {
                 "timestamp": now_str,
@@ -359,29 +350,27 @@ def evaluate_and_dispatch_all(send_signal=True, target_epoch=None):
                 "target_candle_epoch": target_epoch
             }
 
-            if not send_signal:
-                continue
+            # Enforce 8/10 minimum score and filter non-trade outputs
+            if send_signal and direction in ("CALL", "PUT") and score >= 8:
+                eligible_candidates.append(result)
 
-            process_signal_if_strong(
-                symbol=sym,
-                display_name=disp,
-                timeframe="1M",
-                direction=direction,
-                score=score,
-                quality=quality,
-                details=details,
-                entry_price=entry_price,
-                target_epoch=target_epoch
-            )
+        if not send_signal or not eligible_candidates:
+            return
+
+        # Sort by score descending to pick the absolute highest quality setup
+        eligible_candidates.sort(key=lambda x: x["score"], reverse=True)
+        best_candidate = eligible_candidates[0]
+
+        dispatch_best_signal(best_candidate, target_epoch)
 
 # ============================================================
-# HIGH PRECISION SNIPER (0-SECOND CANDLE OPEN TRIGGER)
+# HIGH PRECISION ZERO-LATENCY SNIPER ENGINE
 # ============================================================
 
 def run_precision_sniper():
     """
-    Executes calculations at 58.2s and dispatches alerts directly 
-    at 59.8s - 00.0s, giving a zero-second entry on the new candle.
+    Executes strategy evaluation across all pairs at the 58.2-second mark,
+    dispatches the highest score setup at 59.8s, ensuring entry right at 00.0s.
     """
     logger.info("High precision sniper minute runner active.")
     last_processed_minute = None
@@ -404,11 +393,11 @@ def run_precision_sniper():
 
             time.sleep(0.05)
         except Exception as e:
-            logger.error(f"Sniper runner error: {e}")
+            logger.error(f"Sniper loop fault: {e}")
             time.sleep(1)
 
 # ============================================================
-# BACKGROUND ENGINE INITIALIZATION
+# ENGINE & WORKERS INITIALIZATION
 # ============================================================
 
 def run_engine():
@@ -434,7 +423,7 @@ def run_engine():
         deriv_client.start()
         logger.info("Deriv live engine started successfully.")
     except Exception as e:
-        logger.error(f"Engine startup crash: {e}")
+        logger.error(f"Engine crash: {e}")
 
 def run_outcome_worker():
     while True:
@@ -528,6 +517,11 @@ def api_dashboard():
         "active_pairs": list(FOREX_PAIRS.values())
     })
 
+@app.route("/api/evaluations")
+def api_evaluations():
+    evaluate_and_dispatch_all(send_signal=False)
+    return jsonify(latest_evaluations)
+
 @app.route("/api/active-signals")
 @app.route("/api/signals/active")
 def api_active_signals():
@@ -551,11 +545,6 @@ def api_active_signals():
         }
         for r in rows
     ])
-
-@app.route("/api/evaluations")
-def api_evaluations():
-    evaluate_and_dispatch_all(send_signal=False)
-    return jsonify(latest_evaluations)
 
 @app.route("/api/history")
 def api_history():

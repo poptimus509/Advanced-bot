@@ -15,6 +15,7 @@ from config import (
     DERIV_WS_URL,
 )
 
+
 logger = logging.getLogger("DerivClient")
 
 
@@ -54,11 +55,18 @@ class DerivClient:
         self._connected_monotonic = 0.0
         self._last_tick_monotonic = 0.0
         self._last_time_request = 0.0
+        self._last_rejection_summary = 0.0
 
         self._received_symbols = set()
         self._subscription_errors = {}
         self._last_symbol_epoch = {}
         self._last_handler_error = {}
+
+        self.active_symbols = []
+
+    # ========================================================
+    # PUBLIC METHODS
+    # ========================================================
 
     def register_tick_handler(
         self,
@@ -81,6 +89,7 @@ class DerivClient:
                 daemon=True,
                 name="DerivSocket",
             )
+
             self._watchdog_thread = threading.Thread(
                 target=self._watchdog_loop,
                 daemon=True,
@@ -95,8 +104,10 @@ class DerivClient:
         self._stop_event.set()
         self.is_connected = False
 
-        if self.ws:
-            self.ws.close()
+        socket = self.ws
+
+        if socket is not None:
+            socket.close()
 
     def get_server_epoch(self) -> int:
         return math.floor(self.get_server_time())
@@ -106,11 +117,15 @@ class DerivClient:
             if not self._server_anchor_monotonic:
                 return time.time()
 
-            return (
-                self.server_epoch
-                + time.monotonic()
-                - self._server_anchor_monotonic
+            elapsed = (
+                time.monotonic() - self._server_anchor_monotonic
             )
+
+            return self.server_epoch + elapsed
+
+    # ========================================================
+    # SERVER TIME
+    # ========================================================
 
     def _request_server_time(self, ws):
         with self._state_lock:
@@ -123,6 +138,7 @@ class DerivClient:
                 for key, sent in self._time_requests.items()
                 if now - sent < 60
             }
+
             self._time_requests[request_id] = now
             self._last_time_request = now
 
@@ -131,9 +147,15 @@ class DerivClient:
             "req_id": request_id,
         }))
 
+    # ========================================================
+    # CONNECTION AND RECONNECT
+    # ========================================================
+
     def _run_loop(self):
         while not self._stop_event.is_set():
-            self._received_symbols = set()
+            with self._state_lock:
+                self._received_symbols.clear()
+                self._connected_monotonic = 0.0
 
             try:
                 logger.info("Connecting to Deriv WebSocket.")
@@ -145,10 +167,12 @@ class DerivClient:
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
+
                 self.ws = ws
 
                 interval = max(
-                    float(DERIV_PING_INTERVAL_SECONDS), 15.0
+                    float(DERIV_PING_INTERVAL_SECONDS),
+                    15.0,
                 )
 
                 ws.run_forever(
@@ -157,7 +181,9 @@ class DerivClient:
                 )
 
             except Exception:
-                logger.exception("Deriv connection loop failed.")
+                logger.exception(
+                    "Deriv connection loop failed."
+                )
 
             finally:
                 self.is_connected = False
@@ -165,13 +191,17 @@ class DerivClient:
             if self._stop_event.is_set():
                 break
 
-            # Opening a socket alone does not reset backoff.
-            healthy_session = (
-                bool(self._received_symbols)
-                and self._connected_monotonic > 0
-                and time.monotonic() - self._connected_monotonic >= 60
-            )
+            with self._state_lock:
+                healthy_session = (
+                    bool(self._received_symbols)
+                    and self._connected_monotonic > 0
+                    and (
+                        time.monotonic()
+                        - self._connected_monotonic
+                    ) >= 60
+                )
 
+            # A socket opening without ticks does not reset backoff.
             if healthy_session:
                 self._backoff = 1
 
@@ -181,7 +211,8 @@ class DerivClient:
             )
 
             logger.warning(
-                "Deriv reconnect scheduled in %s seconds.", delay
+                "Deriv reconnect scheduled in %s seconds.",
+                delay,
             )
 
             if self._stop_event.wait(delay):
@@ -198,22 +229,26 @@ class DerivClient:
 
         with self._state_lock:
             self.is_connected = True
+
             self.connected_at_local = time.time()
             self._connected_monotonic = time.monotonic()
+
             self.last_tick_local = 0.0
             self._last_tick_monotonic = 0.0
             self._last_time_request = 0.0
+            self._last_rejection_summary = 0.0
 
             self._received_symbols.clear()
             self._subscription_errors.clear()
             self._last_symbol_epoch.clear()
             self._time_requests.clear()
+            self.active_symbols = []
 
         logger.info(
-            "Deriv socket connected; waiting for subscription responses."
+            "Deriv socket connected; requesting active symbols "
+            "and tick subscriptions."
         )
 
-        # Keep the WebSocket receive callback free of subscription sleeps.
         threading.Thread(
             target=self._subscribe_all,
             args=(ws,),
@@ -224,6 +259,14 @@ class DerivClient:
     def _subscribe_all(self, ws):
         try:
             self._request_server_time(ws)
+
+            # Diagnostic request: discover symbols available to this
+            # connection. Do not guess replacement symbol names.
+            ws.send(json.dumps({
+                "active_symbols": "brief",
+            }))
+
+            logger.info("Active-symbol list requested.")
 
             with self._state_lock:
                 symbols = list(self._tick_subscribers)
@@ -241,14 +284,85 @@ class DerivClient:
                     "subscribe": 1,
                 }))
 
-                logger.info("Subscription requested: %s", symbol)
+                logger.info(
+                    "Subscription requested: %s",
+                    symbol,
+                )
 
                 if self._stop_event.wait(0.1):
                     return
 
         except Exception:
-            logger.exception("Deriv subscription sending failed.")
+            logger.exception(
+                "Deriv subscription sending failed."
+            )
             ws.close()
+
+    # ========================================================
+    # ACTIVE-SYMBOL DIAGNOSTICS
+    # ========================================================
+
+    def _handle_active_symbols(self, data):
+        symbols = data.get("active_symbols", [])
+
+        if not isinstance(symbols, list):
+            logger.error(
+                "Unexpected active_symbols response format."
+            )
+            return
+
+        symbols = [
+            item for item in symbols
+            if isinstance(item, dict)
+        ]
+
+        with self._state_lock:
+            self.active_symbols = symbols
+            requested = set(self._tick_subscribers)
+
+        logger.info(
+            "ACTIVE_SYMBOL_COUNT=%s",
+            len(symbols),
+        )
+
+        available_codes = set()
+
+        for item in symbols:
+            symbol = item.get("symbol")
+
+            if isinstance(symbol, str):
+                available_codes.add(symbol)
+
+            logger.info(
+                "AVAILABLE_SYMBOL symbol=%s name=%s market=%s "
+                "is_open=%s suspended=%s",
+                symbol,
+                item.get("display_name"),
+                item.get("market"),
+                item.get("exchange_is_open"),
+                item.get("is_trading_suspended"),
+            )
+
+        missing = sorted(requested - available_codes)
+        present = sorted(requested & available_codes)
+
+        logger.info(
+            "CONFIGURED_SYMBOLS_PRESENT=%s",
+            present,
+        )
+
+        if missing:
+            logger.warning(
+                "CONFIGURED_SYMBOLS_NOT_IN_ACTIVE_LIST=%s",
+                missing,
+            )
+
+        # Being listed does not by itself prove live tick availability.
+        # FIRST_TICK logs provide that evidence.
+
+    # ========================================================
+    # MESSAGE PROCESSING
+    # ========================================================
 
     def _on_message(self, ws, message):
         if ws is not self.ws:
@@ -259,23 +373,35 @@ class DerivClient:
 
         try:
             data = json.loads(message)
+
             if not isinstance(data, dict):
                 return
 
-            # Error can accompany the original request's msg_type.
+            # API errors can retain the original request's msg_type.
             if data.get("error"):
                 error = data["error"]
                 request = data.get("echo_req") or {}
+
+                if not isinstance(error, dict):
+                    logger.error(
+                        "Unexpected Deriv API error format."
+                    )
+                    return
+
+                if not isinstance(request, dict):
+                    request = {}
+
                 symbol = request.get("ticks")
 
                 if symbol:
                     with self._state_lock:
-                        self._subscription_errors[symbol] = error.get(
-                            "code", "UNKNOWN"
+                        self._subscription_errors[symbol] = (
+                            error.get("code", "UNKNOWN")
                         )
 
                 logger.error(
-                    "DERIV_API_ERROR symbol=%s type=%s code=%s message=%s",
+                    "DERIV_API_ERROR symbol=%s type=%s "
+                    "code=%s message=%s",
                     symbol or request.get("ticks_history", "-"),
                     data.get("msg_type"),
                     error.get("code"),
@@ -285,24 +411,31 @@ class DerivClient:
 
             message_type = data.get("msg_type")
 
+            if message_type == "active_symbols":
+                self._handle_active_symbols(data)
+                return
+
             if message_type == "time":
                 epoch = float(data["time"])
+
                 if not math.isfinite(epoch) or epoch <= 0:
                     return
 
                 with self._state_lock:
                     sent = self._time_requests.pop(
-                        data.get("req_id"), None
+                        data.get("req_id"),
+                        None,
                     )
 
-                    # Reject heavily delayed time responses.
                     if sent is None:
                         return
 
                     round_trip = receipt_mono - sent
+
                     if round_trip > 5:
                         logger.warning(
-                            "Ignoring delayed server-time response: %.2fs",
+                            "Ignoring delayed server-time "
+                            "response: %.2fs",
                             round_trip,
                         )
                         return
@@ -310,10 +443,12 @@ class DerivClient:
                     self.server_epoch = epoch + round_trip / 2
                     self.server_epoch_local_time = receipt_wall
                     self._server_anchor_monotonic = receipt_mono
+
                 return
 
             if message_type == "tick" and data.get("tick"):
                 tick = data["tick"]
+
                 symbol = tick.get("symbol")
                 quote = float(tick["quote"])
                 epoch = int(tick["epoch"])
@@ -330,53 +465,77 @@ class DerivClient:
                     previous_epoch = self._last_symbol_epoch.get(
                         symbol, 0
                     )
+
                     if epoch < previous_epoch:
                         return
 
                     first = symbol not in self._received_symbols
+
                     self._received_symbols.add(symbol)
                     self._subscription_errors.pop(symbol, None)
                     self._last_symbol_epoch[symbol] = epoch
 
                     self.last_tick_local = receipt_wall
                     self._last_tick_monotonic = receipt_mono
+
                     handler = self._tick_subscribers.get(symbol)
 
                 if first:
                     logger.info(
                         "FIRST_TICK symbol=%s epoch=%s quote=%s",
-                        symbol, epoch, quote,
+                        symbol,
+                        epoch,
+                        quote,
                     )
 
-                # Tick timestamps do not reset the server clock.
+                # Do not adjust the server clock from tick timestamps.
                 if handler:
                     try:
-                        handler(epoch, quote, receipt_wall)
+                        handler(
+                            epoch,
+                            quote,
+                            receipt_wall,
+                        )
+
                     except Exception:
                         last_error = self._last_handler_error.get(
                             symbol, 0
                         )
+
                         if receipt_mono - last_error >= 30:
-                            self._last_handler_error[symbol] = receipt_mono
-                            logger.exception(
-                                "TICK_HANDLER_ERROR symbol=%s", symbol
+                            self._last_handler_error[symbol] = (
+                                receipt_mono
                             )
+
+                            logger.exception(
+                                "TICK_HANDLER_ERROR symbol=%s",
+                                symbol,
+                            )
+
                 return
 
             if message_type == "candles":
+                request = data.get("echo_req") or {}
                 symbol = str(
-                    (data.get("echo_req") or {}).get("ticks_history", "")
+                    request.get("ticks_history", "")
                 )
+
                 callback = self._history_callbacks.get(symbol)
+
                 if callback:
                     callback(data)
 
         except Exception:
-            logger.exception("Invalid or unhandled Deriv response.")
+            logger.exception(
+                "Invalid or unhandled Deriv response."
+            )
 
     def _on_error(self, ws, error):
         if ws is self.ws:
-            logger.error("Deriv WebSocket error: %s", error)
+            logger.error(
+                "Deriv WebSocket error: %s",
+                error,
+            )
 
     def _on_close(self, ws, close_status_code, close_msg):
         if ws is self.ws:
@@ -384,8 +543,13 @@ class DerivClient:
 
         logger.warning(
             "Deriv socket closed: code=%s reason=%s",
-            close_status_code, close_msg,
+            close_status_code,
+            close_msg,
         )
+
+    # ========================================================
+    # CONNECTION WATCHDOG
+    # ========================================================
 
     def _watchdog_loop(self):
         while not self._stop_event.wait(5):
@@ -400,72 +564,101 @@ class DerivClient:
                 if now - self._last_time_request >= 25:
                     self._request_server_time(ws)
 
-                reference = (
-                    self._last_tick_monotonic
-                    or self._connected_monotonic
+                with self._state_lock:
+                    reference = (
+                        self._last_tick_monotonic
+                        or self._connected_monotonic
+                    )
+
+                    rejected = dict(self._subscription_errors)
+                    total = len(self._tick_subscribers)
+                    received_count = len(self._received_symbols)
+
+                if not reference or now - reference <= 45:
+                    continue
+
+                if total and len(rejected) == total:
+                    # Keep API errors visible instead of reconnecting
+                    # continuously to the same rejected symbols.
+                    if now - self._last_rejection_summary >= 30:
+                        self._last_rejection_summary = now
+
+                        logger.error(
+                            "All tick subscriptions rejected: %s. "
+                            "Check AVAILABLE_SYMBOL logs.",
+                            rejected,
+                        )
+
+                    continue
+
+                logger.warning(
+                    "NO_LIVE_TICKS for %.1fs; reconnecting. "
+                    "Received symbols=%s; rejected=%s",
+                    now - reference,
+                    received_count,
+                    rejected,
                 )
 
-                if reference and now - reference > 45:
-                    with self._state_lock:
-                        rejected = dict(self._subscription_errors)
-                        total = len(self._tick_subscribers)
-
-                    if total and len(rejected) == total:
-                        # Reconnecting cannot repair invalid symbols or
-                        # market-closed errors. The API error is the evidence.
-                        logger.error(
-                            "All tick subscriptions rejected: %s", rejected
-                        )
-                        if self._stop_event.wait(25):
-                            return
-                        continue
-
-                    logger.warning(
-                        "NO_LIVE_TICKS for %.1fs; reconnecting. "
-                        "Received symbols=%s; rejected=%s",
-                        now - reference,
-                        len(self._received_symbols),
-                        rejected,
-                    )
-                    ws.close()
+                ws.close()
 
             except Exception:
-                logger.exception("Deriv watchdog failed.")
+                logger.exception(
+                    "Deriv watchdog failed."
+                )
+
                 if ws is self.ws:
                     ws.close()
+
+    # ========================================================
+    # SYNCHRONOUS SERVER TIME
+    # ========================================================
 
     def fetch_server_epoch_sync(self) -> int:
         socket = None
 
         try:
             socket = websocket.create_connection(
-                self.ws_url, timeout=10
+                self.ws_url,
+                timeout=10,
             )
-            socket.send(json.dumps({"time": 1, "req_id": 1}))
+
+            socket.send(json.dumps({
+                "time": 1,
+                "req_id": 1,
+            }))
 
             deadline = time.monotonic() + 10
 
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
+
                 if remaining <= 0:
                     break
 
                 socket.settimeout(remaining)
                 payload = json.loads(socket.recv())
 
+                if not isinstance(payload, dict):
+                    continue
+
                 if payload.get("error"):
                     logger.error(
-                        "Server-time API error: %s", payload["error"]
+                        "Server-time API error: %s",
+                        payload["error"],
                     )
                     break
 
                 if payload.get("msg_type") == "time":
                     epoch = int(payload["time"])
+
                     if epoch > 0:
                         return epoch
 
         except Exception as exc:
-            logger.warning("Server-time fetch failed: %s", exc)
+            logger.warning(
+                "Server-time fetch failed: %s",
+                exc,
+            )
 
         finally:
             if socket is not None:
@@ -473,10 +666,18 @@ class DerivClient:
 
         return self.get_server_epoch()
 
+    # ========================================================
+    # HISTORICAL CANDLES
+    # ========================================================
+
     def fetch_historical_candles_batch_sync(
-        self, requests_list: List[dict]
+        self,
+        requests_list: List[dict],
     ) -> Dict[str, List[dict]]:
-        results = {item["key"]: [] for item in requests_list}
+        results = {
+            item["key"]: []
+            for item in requests_list
+        }
 
         if not requests_list:
             return results
@@ -485,12 +686,16 @@ class DerivClient:
 
         try:
             socket = websocket.create_connection(
-                self.ws_url, timeout=10
+                self.ws_url,
+                timeout=10,
             )
 
             pending = {}
 
-            for request_id, item in enumerate(requests_list, start=1):
+            for request_id, item in enumerate(
+                requests_list,
+                start=1,
+            ):
                 pending[request_id] = item
 
                 socket.send(json.dumps({
@@ -507,6 +712,7 @@ class DerivClient:
 
             while pending:
                 remaining = deadline - time.monotonic()
+
                 if remaining <= 0:
                     break
 
@@ -514,7 +720,11 @@ class DerivClient:
 
                 try:
                     payload = json.loads(socket.recv())
+
                 except websocket.WebSocketTimeoutException:
+                    continue
+
+                if not isinstance(payload, dict):
                     continue
 
                 request_id = payload.get("req_id")
@@ -525,8 +735,10 @@ class DerivClient:
 
                 if payload.get("error"):
                     error = payload["error"]
+
                     logger.error(
-                        "HISTORY_API_ERROR key=%s code=%s message=%s",
+                        "HISTORY_API_ERROR key=%s "
+                        "code=%s message=%s",
                         item["key"],
                         error.get("code"),
                         error.get("message"),
@@ -534,17 +746,24 @@ class DerivClient:
                     continue
 
                 candles = payload.get("candles")
+
                 if isinstance(candles, list):
                     results[item["key"]] = candles
 
             if pending:
                 logger.warning(
                     "History requests timed out: %s",
-                    [item["key"] for item in pending.values()],
+                    [
+                        item["key"]
+                        for item in pending.values()
+                    ],
                 )
 
         except Exception as exc:
-            logger.error("Historical batch failed: %s", exc)
+            logger.error(
+                "Historical batch failed: %s",
+                exc,
+            )
 
         finally:
             if socket is not None:
@@ -560,11 +779,13 @@ class DerivClient:
     ) -> List[dict]:
         key = f"{symbol}:{granularity}"
 
-        results = self.fetch_historical_candles_batch_sync([{
-            "key": key,
-            "symbol": symbol,
-            "count": count,
-            "granularity": granularity,
-        }])
+        results = self.fetch_historical_candles_batch_sync([
+            {
+                "key": key,
+                "symbol": symbol,
+                "count": count,
+                "granularity": granularity,
+            }
+        ])
 
         return results.get(key, [])

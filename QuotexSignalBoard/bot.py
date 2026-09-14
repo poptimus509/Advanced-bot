@@ -906,7 +906,6 @@ def run_scan_worker():
                     for manager in candle_managers.values()
                 ]
 
-                # Flexible check: allow scan if at least a majority of candles are ready
                 valid_candles_count = sum(
                     1 for candle in latest_candles 
                     if candle is not None and abs(int(candle.close_epoch) - minute) <= 60
@@ -967,11 +966,12 @@ def run_scan_worker():
 def run_engine():
     try:
         deriv_client.start()
+        time.sleep(2)
         resync_historical_candles()
         ready.set()
         logger.info(
-            "Data engine initialized. "
-            "Fresh ticks and closed history are still required for signals."
+            "Data engine initialized and history seeded. "
+            "Signals are now active."
         )
     except Exception:
         logger.exception("Data engine failed to start.")
@@ -1191,7 +1191,7 @@ def signal_rows(active_only=False):
             "exit_price": row[9],
             "result": row[10],
             "target_candle_epoch": row[11],
-            "performance_basis": "hypothetical Deriv prices",
+            "performance_basis": "hypothetical Deriv reference prices",
         }
         for row in rows
     ]

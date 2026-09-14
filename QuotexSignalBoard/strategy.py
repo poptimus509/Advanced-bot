@@ -1,429 +1,707 @@
 import numpy as np
 import pandas as pd
+
 from config import (
     MIN_1M_HISTORY,
-    MIN_5M_HISTORY,
-    MIN_15M_HISTORY,
-    MIN_ADX_5M,
-    REQUIRE_15M_ALIGNMENT,
-    REQUIRE_5M_1M_ALIGNMENT,
-    REQUIRE_CURRENT_CANDLE_CONFIRMATION,
-    RSI_CALL_MAX,
-    RSI_CALL_MIN,
-    RSI_PUT_MAX,
-    RSI_PUT_MIN,
+    ATR_PERIOD,
+    SWING_REVERSAL_ATR,
+    ZONE_WIDTH_ATR,
+    MIN_CLEARANCE_ATR,
+    MAX_REACTION_RANGE_ATR,
+    ACTIVITY_BASELINE_CANDLES,
     SIGNAL_THRESHOLD_CALL_PUT,
+    CONTEXT_5M_MIN_CANDLES,
+    CONTEXT_5M_RANK_WEIGHT,
 )
 
-# ============================================================
-# TECHNICAL INDICATORS
-# ============================================================
 
-def calculate_ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
+def prepare_history(frame):
+    """Validate closed M1 history without modifying the caller."""
+    if frame is None:
+        raise ValueError("MISSING_HISTORY")
 
-def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
+    df = frame.copy()
+    df.columns = [str(column).lower() for column in df.columns]
 
-    avg_gain = gain.rolling(window=period, min_periods=period).mean()
-    avg_loss = loss.rolling(window=period, min_periods=period).mean()
+    if df.columns.duplicated().any():
+        raise ValueError("DUPLICATE_COLUMNS")
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
+    required = ["time", "open", "high", "low", "close"]
 
-    rsi = rsi.where(avg_loss != 0, 100)
-    rsi = rsi.where(avg_gain != 0, 0)
-    return rsi
+    if any(column not in df.columns for column in required):
+        raise ValueError("MISSING_OHLC_OR_TIME")
 
-def calculate_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    exp_fast = series.ewm(span=fast, adjust=False).mean()
-    exp_slow = series.ewm(span=slow, adjust=False).mean()
+    for column in required:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
-    macd_line = exp_fast - exp_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
+    values = df[required].to_numpy(dtype=float)
 
-def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    # ADX needs roughly two full smoothing windows. Never manufacture trend
-    # strength when the history is not mature enough.
-    if df is None or len(df) < (period * 2):
-        return pd.Series(np.nan, index=df.index if df is not None else [], dtype=float)
+    if not np.isfinite(values).all():
+        raise ValueError("NONFINITE_DATA")
 
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-    close = df["close"].astype(float)
+    if (df["time"] % 60 != 0).any():
+        raise ValueError("INVALID_M1_TIMESTAMP")
 
-    up_move = high.diff()
-    down_move = -low.diff()
+    df = (
+        df.sort_values("time", kind="stable")
+        .drop_duplicates("time", keep="last")
+        .reset_index(drop=True)
+    )
 
-    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
-    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+    if df.empty:
+        raise ValueError("EMPTY_HISTORY")
 
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
+    invalid = (
+        (df["low"] <= 0)
+        | (df["high"] < df["low"])
+        | (df["high"] < df[["open", "close"]].max(axis=1))
+        | (df["low"] > df[["open", "close"]].min(axis=1))
+    )
 
-    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = true_range.rolling(window=period, min_periods=period).mean()
+    if invalid.any():
+        raise ValueError("INVALID_OHLC")
 
-    plus_di_series = 100 * plus_dm.rolling(period, min_periods=period).mean() / atr.replace(0, np.nan)
-    minus_di_series = 100 * minus_dm.rolling(period, min_periods=period).mean() / atr.replace(0, np.nan)
+    # Do not bridge missing market data with invented candles.
+    intervals = df["time"].diff().fillna(60).to_numpy()
+    gaps = np.flatnonzero(intervals != 60)
 
-    di_sum = (plus_di_series + minus_di_series).replace(0, np.nan)
-    dx = 100 * (plus_di_series - minus_di_series).abs() / di_sum
+    if len(gaps):
+        df = df.iloc[int(gaps[-1]):].reset_index(drop=True)
 
-    adx = dx.rolling(window=period, min_periods=period).mean()
-    return adx
+    df["time"] = df["time"].astype("int64")
+    return df
 
-def calculate_directional_strength(df: pd.DataFrame, period: int = 14):
-    if df is None or len(df) < period + 1:
-        return 0.0, 0.0, "NEUTRAL"
 
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-    close = df["close"].astype(float)
+def calculate_atr(df, period=ATR_PERIOD):
+    previous_close = df["close"].shift(1)
 
-    up_move = high.diff()
-    down_move = -low.diff()
+    true_range = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - previous_close).abs(),
+            (df["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
 
-    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
-    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+    return true_range.rolling(
+        period,
+        min_periods=period,
+    ).mean()
 
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
 
-    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = true_range.rolling(window=period, min_periods=period).mean()
+def confirmed_swings(df):
+    """
+    Detect price-reversal pivots without a fixed swing duration.
 
-    plus_di_series = 100 * plus_dm.rolling(period, min_periods=period).mean() / atr.replace(0, np.nan)
-    minus_di_series = 100 * minus_dm.rolling(period, min_periods=period).mean() / atr.replace(0, np.nan)
+    An ATR-sized close reversal confirms the preceding pivot.
+    Unfinished swings are not returned as confirmed structure.
+    """
+    if df is None or len(df) <= ATR_PERIOD:
+        return []
 
-    plus_di = float(plus_di_series.iloc[-1]) if not pd.isna(plus_di_series.iloc[-1]) else 0.0
-    minus_di = float(minus_di_series.iloc[-1]) if not pd.isna(minus_di_series.iloc[-1]) else 0.0
+    atr = calculate_atr(df).to_numpy()
+    closes = df["close"].to_numpy(dtype=float)
 
-    if plus_di > minus_di:
-        direction = "BULLISH"
-    elif minus_di > plus_di:
-        direction = "BEARISH"
+    pivots = []
+    direction = 0
+    high_index = ATR_PERIOD - 1
+    low_index = ATR_PERIOD - 1
+
+    def record(kind, index, confirmed_index):
+        column = "high" if kind == "HIGH" else "low"
+
+        pivots.append({
+            "kind": kind,
+            "price": float(df.iloc[index][column]),
+            "time": int(df.iloc[index]["time"]),
+            "index": int(index),
+            "confirmed_index": int(confirmed_index),
+        })
+
+    for index in range(ATR_PERIOD, len(df)):
+        threshold = (
+            float(atr[index - 1]) * SWING_REVERSAL_ATR
+        )
+
+        if not np.isfinite(threshold) or threshold <= 0:
+            continue
+
+        if direction == 0:
+            if closes[index] > closes[high_index]:
+                high_index = index
+
+            if closes[index] < closes[low_index]:
+                low_index = index
+
+            if closes[index] - closes[low_index] >= threshold:
+                record("LOW", low_index, index)
+                direction = 1
+                high_index = index
+
+            elif closes[high_index] - closes[index] >= threshold:
+                record("HIGH", high_index, index)
+                direction = -1
+                low_index = index
+
+        elif direction == 1:
+            if closes[index] > closes[high_index]:
+                high_index = index
+
+            elif closes[high_index] - closes[index] >= threshold:
+                record("HIGH", high_index, index)
+                direction = -1
+                low_index = index
+
+        else:
+            if closes[index] < closes[low_index]:
+                low_index = index
+
+            elif closes[index] - closes[low_index] >= threshold:
+                record("LOW", low_index, index)
+                direction = 1
+                high_index = index
+
+    return pivots
+
+
+def structure_state(pivots, tolerance):
+    highs = [
+        pivot for pivot in pivots
+        if pivot["kind"] == "HIGH"
+    ]
+    lows = [
+        pivot for pivot in pivots
+        if pivot["kind"] == "LOW"
+    ]
+
+    if len(highs) < 2 or len(lows) < 2:
+        return "UNCONFIRMED", highs, lows
+
+    higher_high = (
+        highs[-1]["price"] > highs[-2]["price"] + tolerance
+    )
+    higher_low = (
+        lows[-1]["price"] > lows[-2]["price"] + tolerance
+    )
+    lower_high = (
+        highs[-1]["price"] < highs[-2]["price"] - tolerance
+    )
+    lower_low = (
+        lows[-1]["price"] < lows[-2]["price"] - tolerance
+    )
+
+    if higher_high and higher_low:
+        return "HH_HL", highs, lows
+
+    if lower_high and lower_low:
+        return "LH_LL", highs, lows
+
+    return "MIXED", highs, lows
+
+
+def active_zones(context, pivots, kind, width):
+    """Build zones from pivots and discard subsequently broken levels."""
+    zones = []
+
+    for pivot in pivots:
+        if pivot["kind"] != kind:
+            continue
+
+        level = pivot["price"]
+        later_closes = context["close"].iloc[
+            pivot["index"] + 1:
+        ]
+
+        if kind == "LOW":
+            if (later_closes < level - width).any():
+                continue
+        else:
+            if (later_closes > level + width).any():
+                continue
+
+        matching = next(
+            (
+                zone for zone in zones
+                if abs(zone["level"] - level) <= width
+            ),
+            None,
+        )
+
+        if matching is None:
+            zones.append({
+                "level": level,
+                "first_time": pivot["time"],
+                "last_time": pivot["time"],
+                "touches": 1,
+            })
+        else:
+            count = matching["touches"]
+
+            matching["level"] = (
+                matching["level"] * count + level
+            ) / (count + 1)
+
+            matching["last_time"] = pivot["time"]
+            matching["touches"] += 1
+
+    return zones
+
+
+def candle_reaction(current, previous, bullish):
+    opening, high, low, close = (
+        float(current[column])
+        for column in ("open", "high", "low", "close")
+    )
+
+    span = high - low
+    if span <= 0:
+        return None
+
+    body = abs(close - opening)
+    body_ratio = body / span
+    close_location = (close - low) / span
+
+    upper_wick = high - max(opening, close)
+    lower_wick = min(opening, close) - low
+
+    previous_open = float(previous["open"])
+    previous_close = float(previous["close"])
+
+    if bullish:
+        if close <= opening or close_location < 0.65:
+            return None
+
+        engulfing = (
+            previous_close < previous_open
+            and opening <= previous_close
+            and close >= previous_open
+            and body_ratio >= 0.45
+        )
+
+        rejection = (
+            lower_wick >= body * 1.3
+            and lower_wick >= span * 0.35
+            and body_ratio >= 0.15
+        )
+
+        continuation = (
+            body_ratio >= 0.60
+            and close > float(previous["high"])
+        )
+
     else:
-        direction = "NEUTRAL"
+        if close >= opening or close_location > 0.35:
+            return None
 
-    return plus_di, minus_di, direction
+        engulfing = (
+            previous_close > previous_open
+            and opening >= previous_close
+            and close <= previous_open
+            and body_ratio >= 0.45
+        )
 
-# ============================================================
-# MARKET STRUCTURE & CANDLESTICK DYNAMICS
-# ============================================================
+        rejection = (
+            upper_wick >= body * 1.3
+            and upper_wick >= span * 0.35
+            and body_ratio >= 0.15
+        )
 
-def detect_bos(df: pd.DataFrame, lookback: int = 5) -> str:
-    if df is None or len(df) < lookback + 1:
-        return "NEUTRAL"
+        continuation = (
+            body_ratio >= 0.60
+            and close < float(previous["low"])
+        )
 
-    recent_high = df["high"].iloc[-lookback - 1:-1].max()
-    recent_low = df["low"].iloc[-lookback - 1:-1].min()
-    current_close = df["close"].iloc[-1]
+    if not (engulfing or rejection or continuation):
+        return None
 
-    if current_close > recent_high:
-        return "BULLISH_BOS"
-    if current_close < recent_low:
-        return "BEARISH_BOS"
-    return "NEUTRAL"
+    if engulfing:
+        name = "ENGULFING"
+    elif rejection:
+        name = "REJECTION"
+    else:
+        name = "CONTINUATION"
 
-def detect_candlestick_pattern(df: pd.DataFrame) -> str:
-    if df is None or len(df) < 2:
-        return "NEUTRAL"
+    return {
+        "name": name,
+        "body_ratio": body_ratio,
+        "close_location": close_location,
+    }
 
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
 
-    open_price = float(curr["open"])
-    high = float(curr["high"])
-    low = float(curr["low"])
-    close = float(curr["close"])
+def activity_pressure(df):
+    """
+    Estimate M1 price pressure weighted by live quote-update activity.
 
-    candle_range = high - low
-    if candle_range <= 0:
-        return "NEUTRAL"
+    This is not traded volume, order flow, or buyer/seller percentages.
+    Unverified historical tickscount values are not used.
+    """
+    result = {
+        "activity_status": "UNAVAILABLE",
+        "relative_activity": None,
+        "pressure": None,
+    }
 
-    body = abs(close - open_price)
-    upper_wick = high - max(open_price, close)
-    lower_wick = min(open_price, close) - low
-    body_ratio = body / candle_range
+    needed = ACTIVITY_BASELINE_CANDLES + 1
 
-    bullish = close > open_price
-    bearish = close < open_price
+    if "verified_ticks" not in df.columns or len(df) < needed:
+        return result
 
-    # Solid Momentum Breakout
-    if bullish and body_ratio >= 0.50 and close >= float(prev["high"]):
-        return "BULLISH"
-    if bearish and body_ratio >= 0.50 and close <= float(prev["low"]):
-        return "BEARISH"
+    window = df.tail(needed)
+    ticks = pd.to_numeric(
+        window["verified_ticks"],
+        errors="coerce",
+    )
 
-    # Rejection Pinbars
-    if bullish and lower_wick >= body * 1.3 and lower_wick > upper_wick:
-        return "BULLISH"
-    if bearish and upper_wick >= body * 1.3 and upper_wick > lower_wick:
-        return "BEARISH"
+    tick_values = ticks.to_numpy(dtype=float)
 
-    # Engulfing Setup
-    prev_open = float(prev["open"])
-    prev_close = float(prev["close"])
-    if bullish and prev_close < prev_open and close >= prev_open:
-        return "BULLISH"
-    if bearish and prev_close > prev_open and close <= prev_open:
-        return "BEARISH"
+    if not np.isfinite(tick_values).all():
+        return result
 
-    return "NEUTRAL"
+    if (ticks <= 0).any():
+        return result
 
-def _get_epoch(index_value) -> int:
-    try:
-        if hasattr(index_value, "timestamp"):
-            return int(index_value.timestamp())
-        return int(index_value)
-    except Exception:
-        return 0
+    baseline = float(ticks.iloc[:-1].median())
+    if baseline <= 0:
+        return result
 
-# ============================================================
-# CORE STRATEGY EVALUATION
-# ============================================================
+    current = window.iloc[-1]
+    span = float(current["high"] - current["low"])
 
-def evaluate_strategy(df_1m: pd.DataFrame, df_5m: pd.DataFrame, df_15m: pd.DataFrame):
+    if span <= 0:
+        return result
+
+    relative_activity = float(ticks.iloc[-1]) / baseline
+
+    close_location = (
+        2 * float(current["close"])
+        - float(current["high"])
+        - float(current["low"])
+    ) / span
+
+    body_efficiency = (
+        abs(float(current["close"] - current["open"])) / span
+    )
+
+    pressure = (
+        close_location
+        * body_efficiency
+        * min(relative_activity, 3.0)
+    )
+
+    result.update({
+        "activity_status": "LIVE_TICK_PROXY",
+        "relative_activity": relative_activity,
+        "pressure": pressure,
+    })
+
+    return result
+
+
+def get_5m_context(df):
+    """
+    Aggregate complete M5 candles from validated closed M1 history.
+
+    M5 supplies context only. It cannot create or veto an M1 signal.
+    """
+    result = {
+        "trend_5m": "UNAVAILABLE",
+        "context_5m_reason": "Insufficient complete M5 history",
+    }
+
+    if df is None or df.empty:
+        return result
+
+    work = df[
+        ["time", "open", "high", "low", "close"]
+    ].copy()
+
+    work["bucket"] = (work["time"] // 300) * 300
+
+    candles = work.groupby("bucket", sort=True).agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        count=("time", "size"),
+        first_time=("time", "min"),
+        last_time=("time", "max"),
+    )
+
+    latest_closed_epoch = int(work["time"].max()) + 60
+
+    complete = (
+        (candles["count"] == 5)
+        & (candles["first_time"] == candles.index)
+        & (candles["last_time"] == candles.index + 240)
+        & (candles.index + 300 <= latest_closed_epoch)
+    )
+
+    candles = candles.loc[complete]
+
+    if len(candles) < CONTEXT_5M_MIN_CANDLES:
+        return result
+
+    closes = candles["close"].astype(float)
+    fast = closes.ewm(span=5, adjust=False).mean()
+    slow = closes.ewm(span=10, adjust=False).mean()
+
+    rising = fast.iloc[-1] > fast.iloc[-2]
+    falling = fast.iloc[-1] < fast.iloc[-2]
+
+    if fast.iloc[-1] > slow.iloc[-1] and rising:
+        trend = "BULLISH"
+        reason = "M5 EMA5 above EMA10 and rising"
+
+    elif fast.iloc[-1] < slow.iloc[-1] and falling:
+        trend = "BEARISH"
+        reason = "M5 EMA5 below EMA10 and falling"
+
+    else:
+        trend = "NEUTRAL"
+        reason = "M5 trend is mixed or flattening"
+
+    return {
+        "trend_5m": trend,
+        "context_5m_reason": reason,
+    }
+
+
+def evaluate_strategy(df_1m, df_5m=None, df_15m=None):
+    """
+    M1 drives structure, zones, reaction and activity pressure.
+
+    Optional dataframe arguments preserve the old call signature.
+    M5 context is derived from complete M1 history.
+    M15 is not used.
+    """
     details = {
-        "bias": "NEUTRAL",
+        "bias": "NOT_USED",
         "trend": "NEUTRAL",
-        "structure": "NEUTRAL",
+        "structure": "UNCONFIRMED",
         "pa": "NEUTRAL",
         "score_reason": "",
         "signal_candle_epoch": None,
-        "threshold_used": SIGNAL_THRESHOLD_CALL_PUT,
-        "timeframe_alignment": "NEUTRAL",
-        "adx_5m": 0.0,
-        "rsi_1m": 50.0,
-        "macd_momentum": "NEUTRAL",
-        "ema_alignment": "NEUTRAL",
-        "candle_flow": "NEUTRAL",
-        "alignment_score": 0,
-        "momentum_strength": 0.0,
-        "ema_spread_pct": 0.0,
         "call_score": 0,
         "put_score": 0,
+        "alignment_score": 0,
+        "rank_strength": 0.0,
+        "activity_status": "UNAVAILABLE",
+        "relative_activity": None,
+        "pressure": None,
+        "trend_5m": "UNAVAILABLE",
+        "context_5m_reason": "",
+        "setup_id": None,
+        "threshold_used": SIGNAL_THRESHOLD_CALL_PUT,
     }
 
+    def reject(reason):
+        details["score_reason"] = reason
+        return "NO_TRADE", 0, reason, details
+
+    try:
+        df = prepare_history(df_1m)
+    except (ValueError, TypeError, KeyError) as exc:
+        return reject(str(exc))
+
+    if len(df) < MIN_1M_HISTORY:
+        return reject("INSUFFICIENT_CONTIGUOUS_HISTORY")
+
+    current = df.iloc[-1]
+    previous = df.iloc[-2]
+
+    details["signal_candle_epoch"] = int(current["time"])
+    details.update(get_5m_context(df))
+
+    # Structure and zones must exist before the reaction candle.
+    context = df.iloc[:-1].reset_index(drop=True)
+    atr = float(calculate_atr(context).iloc[-1])
+
+    if not np.isfinite(atr) or atr <= 0:
+        return reject("INVALID_ATR")
+
+    details["atr"] = atr
+    width = atr * ZONE_WIDTH_ATR
+
+    pivots = confirmed_swings(context)
+    state, highs, lows = structure_state(
+        pivots,
+        tolerance=width * 0.5,
+    )
+
+    details["structure"] = state
+
+    if state not in ("HH_HL", "LH_LL"):
+        return reject("STRUCTURE_UNCONFIRMED_OR_MIXED")
+
+    bullish = state == "HH_HL"
+    direction = "CALL" if bullish else "PUT"
+
+    details["trend"] = "BULLISH" if bullish else "BEARISH"
+
+    close = float(current["close"])
+
+    if bullish and close < lows[-1]["price"] - width:
+        return reject("BULLISH_STRUCTURE_BROKEN")
+
+    if not bullish and close > highs[-1]["price"] + width:
+        return reject("BEARISH_STRUCTURE_BROKEN")
+
+    span = float(current["high"] - current["low"])
+
+    if span > MAX_REACTION_RANGE_ATR * atr:
+        return reject("REACTION_CANDLE_OVEREXTENDED")
+
+    reaction = candle_reaction(current, previous, bullish)
+
+    if reaction is None:
+        return reject("NO_CONFIRMED_REACTION")
+
+    supports = active_zones(
+        context, pivots, "LOW", width
+    )
+    resistances = active_zones(
+        context, pivots, "HIGH", width
+    )
+
+    entry_zones = supports if bullish else resistances
+    candidates = []
+
+    for zone in entry_zones:
+        level = zone["level"]
+
+        touches = (
+            float(current["low"]) <= level + width
+            and float(current["high"]) >= level - width
+        )
+
+        holds = close > level if bullish else close < level
+        near = abs(close - level) <= atr
+
+        if touches and holds and near:
+            candidates.append(zone)
+
+    if not candidates:
+        return reject("NO_SUPPORT_RESISTANCE_REACTION")
+
+    zone = min(
+        candidates,
+        key=lambda item: abs(close - item["level"]),
+    )
+
+    opposite_zones = resistances if bullish else supports
+
+    distances = [
+        (
+            opposite["level"] - width - close
+            if bullish
+            else close - opposite["level"] - width
+        )
+        for opposite in opposite_zones
+        if (
+            opposite["level"] >= close
+            if bullish
+            else opposite["level"] <= close
+        )
+    ]
+
+    clearance = min(distances) / atr if distances else None
+    details["clearance_atr"] = clearance
+
+    if clearance is not None and clearance < MIN_CLEARANCE_ATR:
+        return reject("OPPOSITE_ZONE_TOO_CLOSE")
+
+    pressure_data = activity_pressure(df)
+    details.update(pressure_data)
+
+    directional_pressure = pressure_data["pressure"]
+
+    if directional_pressure is not None:
+        directional_pressure *= 1 if bullish else -1
+
+        if directional_pressure < 0:
+            return reject("OPPOSING_TICK_PRESSURE")
+
+    # Heuristic setup score, not an estimated success probability.
+    score = 8
+
+    if zone["touches"] >= 2:
+        score += 1
+
     if (
-        df_1m is None or df_5m is None or df_15m is None
-        or len(df_1m) < MIN_1M_HISTORY
-        or len(df_5m) < MIN_5M_HISTORY
-        or len(df_15m) < MIN_15M_HISTORY
+        directional_pressure is not None
+        and directional_pressure >= 0.3
+        and pressure_data["relative_activity"] >= 1.0
     ):
-        return ("NO_TRADE", 0, "INSUFFICIENT_DATA", details)
+        score += 1
 
-    df_1m.columns = [str(col).lower() for col in df_1m.columns]
-    df_5m.columns = [str(col).lower() for col in df_5m.columns]
-    if df_15m is not None:
-        df_15m.columns = [str(col).lower() for col in df_15m.columns]
+    anchor = (
+        f"{highs[-1]['time']}:"
+        f"{lows[-1]['time']}:"
+        f"{zone['first_time']}"
+    )
 
-    latest_1m = df_1m.iloc[-1]
-    details["signal_candle_epoch"] = _get_epoch(latest_1m.name)
+    clearance_component = (
+        min(clearance, 3.0) * 0.1
+        if clearance is not None
+        else 0.0
+    )
 
-    # 1. 15M Macro Context (+1 point)
-    bias_15m = "NEUTRAL"
-    if df_15m is not None and len(df_15m) >= MIN_15M_HISTORY:
-        close_15m = float(df_15m["close"].iloc[-1])
-        ema20_15m = float(calculate_ema(df_15m["close"], 20).iloc[-1])
-        if ema20_15m != 0:
-            if close_15m > ema20_15m:
-                bias_15m = "BULLISH"
-            elif close_15m < ema20_15m:
-                bias_15m = "BEARISH"
-    details["bias"] = bias_15m
+    pressure_component = (
+        max(directional_pressure, 0.0) * 0.1
+        if directional_pressure is not None
+        else 0.0
+    )
 
-    # 2. 5M Structural Trend (+2 points)
-    ema20_5m = float(calculate_ema(df_5m["close"], 20).iloc[-1])
-    ema50_5m = float(calculate_ema(df_5m["close"], 50).iloc[-1])
-    structure_5m = detect_bos(df_5m, lookback=5)
-    details["structure"] = structure_5m
+    rank_strength = (
+        reaction["body_ratio"]
+        + min(zone["touches"], 3) * 0.1
+        + clearance_component
+        + pressure_component
+    )
 
-    adx_series = calculate_adx(df_5m, period=14)
-    adx_5m = float(adx_series.iloc[-1]) if not pd.isna(adx_series.iloc[-1]) else 0.0
-    plus_di, minus_di, di_direction = calculate_directional_strength(df_5m, period=14)
-    details["adx_5m"] = round(adx_5m, 2)
+    # M5 changes only the ranking slightly between equal-score setups.
+    expected_5m = "BULLISH" if bullish else "BEARISH"
+    opposite_5m = "BEARISH" if bullish else "BULLISH"
+    trend_5m = details["trend_5m"]
 
-    if ema20_5m > ema50_5m:
-        trend_5m = "BULLISH"
-    elif ema20_5m < ema50_5m:
-        trend_5m = "BEARISH"
-    else:
-        trend_5m = "NEUTRAL"
-    details["trend"] = trend_5m
+    if trend_5m == expected_5m:
+        rank_strength += CONTEXT_5M_RANK_WEIGHT
 
-    # 3. 1M Entry Momentum (+5 points total across indicators)
-    ema9_1m = float(calculate_ema(df_1m["close"], 9).iloc[-1])
-    ema21_1m = float(calculate_ema(df_1m["close"], 21).iloc[-1])
-    rsi_series = calculate_rsi(df_1m["close"], 14)
-    rsi_14_1m = float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50.0
-    details["rsi_1m"] = round(rsi_14_1m, 1)
+    elif trend_5m == opposite_5m:
+        rank_strength -= CONTEXT_5M_RANK_WEIGHT
 
-    _, _, macd_hist = calculate_macd(df_1m["close"])
-    curr_hist = float(macd_hist.iloc[-1])
-    prev_hist = float(macd_hist.iloc[-2])
+    details.update({
+        "setup_id": f"{direction}:{anchor}",
+        "zone": float(zone["level"]),
+        "zone_touches": zone["touches"],
+        "pa": reaction["name"],
+        "alignment_score": 3,
+        "rank_strength": rank_strength,
+        "call_score": score if bullish else 0,
+        "put_score": score if not bullish else 0,
+    })
 
-    pa_1m = detect_candlestick_pattern(df_1m)
-    details["pa"] = pa_1m
+    relative_activity = pressure_data["relative_activity"]
 
-    # 1M EMA (+2 points)
-    ema_direction = "BULLISH" if ema9_1m > ema21_1m else ("BEARISH" if ema9_1m < ema21_1m else "NEUTRAL")
-    details["ema_alignment"] = ema_direction
-    ema_base = abs(float(df_1m["close"].iloc[-1])) or 1.0
-    details["ema_spread_pct"] = round(abs(ema9_1m - ema21_1m) / ema_base * 100.0, 6)
-
-    # MACD (+1 point)
-    if curr_hist > 0 and curr_hist >= prev_hist:
-        macd_direction = "BULLISH"
-    elif curr_hist < 0 and curr_hist <= prev_hist:
-        macd_direction = "BEARISH"
-    else:
-        macd_direction = "NEUTRAL"
-    details["macd_momentum"] = macd_direction
-    details["momentum_strength"] = round(abs(curr_hist - prev_hist), 10)
-
-    latest_open = float(latest_1m["open"])
-    latest_close = float(latest_1m["close"])
-    if latest_close > latest_open:
-        candle_flow = "BULLISH"
-    elif latest_close < latest_open:
-        candle_flow = "BEARISH"
-    else:
-        candle_flow = "NEUTRAL"
-    details["candle_flow"] = candle_flow
-
-    # 4. Point Scoring Engine
-    call_score, put_score = 0, 0
-    call_reasons, put_reasons = [], []
-
-    # 15M (+1)
-    if bias_15m == "BULLISH":
-        call_score += 1
-        call_reasons.append("15M Bullish")
-    elif bias_15m == "BEARISH":
-        put_score += 1
-        put_reasons.append("15M Bearish")
-
-    # 5M Trend (+2)
-    if trend_5m == "BULLISH":
-        call_score += 2
-        call_reasons.append("5M Trend Bullish")
-    elif trend_5m == "BEARISH":
-        put_score += 2
-        put_reasons.append("5M Trend Bearish")
-
-    # 5M ADX/DI (+1)
-    if adx_5m >= MIN_ADX_5M:
-        if di_direction == "BULLISH":
-            call_score += 1
-            call_reasons.append("5M DI+ Bullish")
-        elif di_direction == "BEARISH":
-            put_score += 1
-            put_reasons.append("5M DI- Bearish")
-
-    # 1M EMA (+2)
-    if ema_direction == "BULLISH":
-        call_score += 2
-        call_reasons.append("1M EMA9>21")
-    elif ema_direction == "BEARISH":
-        put_score += 2
-        put_reasons.append("1M EMA9<21")
-
-    # 1M RSI (+1)
-    if RSI_CALL_MIN <= rsi_14_1m <= RSI_CALL_MAX:
-        call_score += 1
-        call_reasons.append(f"RSI Bullish ({rsi_14_1m:.0f})")
-    elif RSI_PUT_MIN <= rsi_14_1m <= RSI_PUT_MAX:
-        put_score += 1
-        put_reasons.append(f"RSI Bearish ({rsi_14_1m:.0f})")
-
-    # 1M MACD (+1)
-    if macd_direction == "BULLISH":
-        call_score += 1
-        call_reasons.append("MACD Bullish")
-    elif macd_direction == "BEARISH":
-        put_score += 1
-        put_reasons.append("MACD Bearish")
-
-    # 1M Price Action (+2 points)
-    if pa_1m == "BULLISH":
-        call_score += 2
-        call_reasons.append("1M PA Bullish")
-    elif pa_1m == "BEARISH":
-        put_score += 2
-        put_reasons.append("1M PA Bearish")
-
-    details["call_score"] = call_score
-    details["put_score"] = put_score
-
-    # 5. Determine Primary Direction
-    if call_score > put_score:
-        direction = "CALL"
-        final_score = call_score
-        reasons = call_reasons
-    elif put_score > call_score:
-        direction = "PUT"
-        final_score = put_score
-        reasons = put_reasons
-    else:
-        details["score_reason"] = f"Equal: CALL={call_score}, PUT={put_score}"
-        return ("NO_TRADE", max(call_score, put_score), "NO_TRADE", details)
-
-    # --------------------------------------------------------
-    # STRICT FILTER: REJECT OPPOSING CANDLE MOMENTUM
-    # --------------------------------------------------------
-    if direction == "CALL" and pa_1m == "BEARISH":
-        details["score_reason"] = "Rejected: CALL setup opposed by Bearish 1M price action."
-        return ("NO_TRADE", final_score, "CONTRADICTING_PA", details)
-
-    if direction == "PUT" and pa_1m == "BULLISH":
-        details["score_reason"] = "Rejected: PUT setup opposed by Bullish 1M price action."
-        return ("NO_TRADE", final_score, "CONTRADICTING_PA", details)
-
-    # 15M is a soft macro bias. The execution gate is built from the 5M
-    # structural trend and the 1M EMA/MACD entry momentum.
-    expected = "BULLISH" if direction == "CALL" else "BEARISH"
-    alignment_components = [bias_15m, trend_5m, ema_direction, macd_direction]
-    details["alignment_score"] = sum(value == expected for value in alignment_components)
-
-    if REQUIRE_15M_ALIGNMENT and bias_15m != expected:
-        details["score_reason"] = (
-            f"Rejected: {direction} conflicts with 15M bias ({bias_15m})."
+    if relative_activity is not None:
+        activity_text = (
+            f"M1 tick activity {relative_activity:.2f}x"
         )
-        return ("NO_TRADE", final_score, "15M_MISALIGNMENT", details)
+    else:
+        activity_text = "M1 tick activity unavailable"
 
-    entry_alignment = [trend_5m, ema_direction, macd_direction]
-    if REQUIRE_5M_1M_ALIGNMENT and any(value != expected for value in entry_alignment):
-        details["score_reason"] = (
-            f"Rejected: {direction} is not aligned across 5M/1M/MACD "
-            f"({trend_5m}, {ema_direction}, {macd_direction}); 15M bias={bias_15m}."
-        )
-        return ("NO_TRADE", final_score, "ENTRY_TIMEFRAME_MISALIGNMENT", details)
+    zone_name = "support" if bullish else "resistance"
 
-    if REQUIRE_CURRENT_CANDLE_CONFIRMATION and candle_flow != expected:
-        details["score_reason"] = f"Rejected: latest closed 1M candle is {candle_flow}."
-        return ("NO_TRADE", final_score, "CANDLE_NOT_CONFIRMED", details)
+    details["score_reason"] = (
+        f"M1 {state}; "
+        f"{reaction['name']}; "
+        f"{zone_name}={zone['level']:.6f}; "
+        f"{activity_text}; "
+        f"M5 context={trend_5m}"
+    )
 
-    if adx_5m < MIN_ADX_5M:
-        details["score_reason"] = f"Rejected: 5M ADX {adx_5m:.2f} is below {MIN_ADX_5M:.2f}."
-        return ("NO_TRADE", final_score, "WEAK_TREND", details)
+    if score < SIGNAL_THRESHOLD_CALL_PUT:
+        return reject("BELOW_SCORE_THRESHOLD")
 
-    # High quality execution threshold: 8 out of 10
-    threshold = SIGNAL_THRESHOLD_CALL_PUT
-    details["threshold_used"] = threshold
-
-    if final_score < threshold:
-        details["score_reason"] = f"{direction} score {final_score}/10 below strict threshold {threshold}"
-        return ("NO_TRADE", final_score, "LOW_SCORE", details)
-
-    quality = "A+" if final_score >= 9 else "A"
-    details["score_reason"] = f"{direction} {final_score}/10 | " + ", ".join(reasons)
-
-    return (direction, final_score, quality, details)
+    return direction, score, "SETUP_CONFIRMED", details

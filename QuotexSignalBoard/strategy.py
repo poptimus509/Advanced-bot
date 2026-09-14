@@ -140,19 +140,19 @@ def detect_candlestick_pattern(df):
     bullish = close > open_price
     bearish = close < open_price
 
-    # Solid momentum candle (Relaxed to 0.45 for binary options)
-    if bullish and body_ratio >= 0.45 and close >= float(prev["high"]):
+    # Solid breakout momentum
+    if bullish and body_ratio >= 0.50 and close >= float(prev["high"]):
         return "BULLISH"
-    if bearish and body_ratio >= 0.45 and close <= float(prev["low"]):
+    if bearish and body_ratio >= 0.50 and close <= float(prev["low"]):
         return "BEARISH"
 
-    # Hammer / Pinbar Rejections
-    if bullish and lower_wick >= body * 1.2 and lower_wick > upper_wick:
+    # Rejection Pinbars
+    if bullish and lower_wick >= body * 1.3 and lower_wick > upper_wick:
         return "BULLISH"
-    if bearish and upper_wick >= body * 1.2 and upper_wick > lower_wick:
+    if bearish and upper_wick >= body * 1.3 and upper_wick > lower_wick:
         return "BEARISH"
 
-    # Engulfing
+    # Engulfing pattern
     prev_open = float(prev["open"])
     prev_close = float(prev["close"])
     if bullish and prev_close < prev_open and close >= prev_open:
@@ -182,7 +182,7 @@ def evaluate_strategy(df_1m, df_5m, df_15m):
         "pa": "NEUTRAL",
         "score_reason": "",
         "signal_candle_epoch": None,
-        "threshold_used": 6,
+        "threshold_used": 7,
         "timeframe_alignment": "NEUTRAL",
         "adx_5m": 0.0,
         "rsi_1m": 50.0,
@@ -245,7 +245,7 @@ def evaluate_strategy(df_1m, df_5m, df_15m):
     pa_1m = detect_candlestick_pattern(df_1m)
     details["pa"] = pa_1m
 
-    # 1M EMA Direction (+2)
+    # 1M EMA (+2)
     ema_direction = "BULLISH" if ema9_1m > ema21_1m else ("BEARISH" if ema9_1m < ema21_1m else "NEUTRAL")
     details["ema_alignment"] = ema_direction
 
@@ -332,15 +332,15 @@ def evaluate_strategy(df_1m, df_5m, df_15m):
         details["score_reason"] = f"Equal: CALL={call_score}, PUT={put_score}"
         return ("NO_TRADE", max(call_score, put_score), "NO_TRADE", details)
 
-    # Balanced threshold: 6 out of 10 gives reliable 1-minute entries
-    threshold = 6
+    # হাই-অ্যাকিউরেসি ফিল্টারিংয়ের জন্য থ্রেশহোল্ড ৭
+    threshold = 7
     details["threshold_used"] = threshold
 
     if final_score < threshold:
         details["score_reason"] = f"{direction} score {final_score}/10 below threshold {threshold}"
         return ("NO_TRADE", final_score, "LOW_SCORE", details)
 
-    quality = "A+" if final_score >= 8 else ("A" if final_score >= 7 else "B+")
+    quality = "A+" if final_score >= 9 else ("A" if final_score >= 8 else "B+")
     details["score_reason"] = f"{direction} {final_score}/10 | " + ", ".join(reasons)
 
     return (direction, final_score, quality, details)

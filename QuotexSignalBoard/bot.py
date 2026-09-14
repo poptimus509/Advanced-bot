@@ -1128,10 +1128,18 @@ def health():
 
 @app.route("/api/dashboard")
 def api_dashboard():
+    fresh = sum(
+        live_quote(symbol) is not None
+        for symbol in cfg.FOREX_PAIRS
+    )
+    total = len(cfg.FOREX_PAIRS)
+    is_connected = bool(deriv_client.is_connected and ready.is_set() and fresh > 0)
+
     return jsonify({
         "status": (
             "online" if ready.is_set() else "starting"
         ),
+        "connected": is_connected,
         "deriv_connected": bool(deriv_client.is_connected),
         "performance": get_today_performance(),
         "performance_basis": "hypothetical Deriv reference prices",

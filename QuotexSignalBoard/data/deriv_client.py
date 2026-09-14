@@ -75,6 +75,10 @@ class DerivClient:
 
     def register_tick_handler(self, symbol, handler):
         self.tick_handlers[symbol] = handler
+        # Also register normalized variants to ensure robust mapping
+        clean = symbol.replace("frx", "")
+        self.tick_handlers[clean] = handler
+        self.tick_handlers[f"frx{clean}"] = handler
 
     def start(self):
         self.connect()
@@ -119,6 +123,7 @@ class DerivClient:
         
         for symbol in ACTIVE_SYMBOLS:
             clean_symbol = symbol.replace("frx", "")
+            # Send subscriptions for both frx prefix and clean symbol to guarantee data flow
             for target_sym in [f"frx{clean_symbol}", clean_symbol]:
                 req = {"ticks": target_sym, "subscribe": 1}
                 ws.send(json.dumps(req))
@@ -138,9 +143,15 @@ class DerivClient:
                     
                     self.server_time = epoch
                     
-                    if symbol in self.tick_handlers:
+                    # Match symbol across possible variants in tick handlers
+                    handler = self.tick_handlers.get(symbol)
+                    if not handler and symbol:
+                        clean = symbol.replace("frx", "")
+                        handler = self.tick_handlers.get(clean) or self.tick_handlers.get(f"frx{clean}")
+
+                    if handler:
                         try:
-                            self.tick_handlers[symbol](epoch, quote, time.monotonic())
+                            handler(epoch, quote, time.monotonic())
                         except Exception as e:
                             logger.error(f"Error in tick handler for {symbol}: {e}")
                             
@@ -165,7 +176,7 @@ class DerivClient:
                 if sym:
                     self.history_cache[sym] = formatted_candles
                 self.history_event.set()
-                    
+                
             elif msg_type == "error":
                 err = data.get("error", {})
                 err_code = err.get("code")

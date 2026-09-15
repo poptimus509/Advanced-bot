@@ -4,7 +4,7 @@ import websocket
 import threading
 import time
 from typing import Dict, List, Any, Optional
-from config import APP_ID, API_TOKEN, ACTIVE_SYMBOLS
+import config as cfg
 
 logger = logging.getLogger("QuotexSignalBoard")
 
@@ -41,13 +41,8 @@ class DerivClient:
             return self._req_id_counter
 
     def fetch_historical_candles_batch_sync(self, jobs: List[dict]) -> Dict[str, List[dict]]:
-        """
-        Fetches historical candles for multiple symbols concurrently and safely
-        using individual request IDs to prevent race conditions and freezes.
-        """
         results = {}
         if not self.ws or not self.connected:
-            logger.warning("fetch_historical_candles_batch_sync called while WebSocket disconnected.")
             return {job.get("key", ""): [] for job in jobs}
 
         for job in jobs:
@@ -56,7 +51,7 @@ class DerivClient:
             count = job.get("count", 100)
             granularity = job.get("granularity", 60)
 
-            clean_symbol = symbol.replace("frx", "")
+            clean_symbol = symbol.replace("frx", "").replace("/", "").upper()
             target_sym = f"frx{clean_symbol}"
 
             req_id = self._get_next_req_id()
@@ -75,19 +70,16 @@ class DerivClient:
 
             try:
                 self.ws.send(json.dumps(req))
-                # Wait up to 3.0s for this specific request
                 if event.wait(timeout=3.0):
                     candles = self._request_results.pop(req_id, [])
                     if candles:
                         results[key] = candles
                     else:
-                        # Fallback to clean symbol if empty
                         results[key] = self._fetch_single_history(clean_symbol, count, granularity)
                 else:
-                    # Timeout on frx, try fallback
                     results[key] = self._fetch_single_history(clean_symbol, count, granularity)
             except Exception as e:
-                logger.error(f"Error fetching history for {symbol} (key={key}): {e}")
+                logger.error(f"Error fetching history for {symbol}: {e}")
                 results[key] = []
             finally:
                 self._pending_requests.pop(req_id, None)
@@ -96,7 +88,6 @@ class DerivClient:
         return results
 
     def _fetch_single_history(self, symbol: str, count: int, granularity: int) -> List[dict]:
-        """Fallback helper to fetch history for raw/clean symbol name."""
         req_id = self._get_next_req_id()
         event = threading.Event()
         self._pending_requests[req_id] = event
@@ -113,24 +104,24 @@ class DerivClient:
             self.ws.send(json.dumps(req))
             if event.wait(timeout=3.0):
                 return self._request_results.pop(req_id, [])
-        except Exception as e:
-            logger.error(f"Fallback history request failed for {symbol}: {e}")
+        except Exception:
+            pass
         finally:
             self._pending_requests.pop(req_id, None)
             self._request_results.pop(req_id, None)
         return []
 
     def register_tick_handler(self, symbol: str, handler):
-        clean = symbol.replace("frx", "")
-        self.tick_handlers[symbol] = handler
-        self.tick_handlers[clean] = handler
-        self.tick_handlers[f"frx{clean}"] = handler
+        clean = symbol.replace("frx", "").replace("/", "").upper()
+        for variant in [symbol, clean, f"frx{clean}", f"{clean[:3]}/{clean[3:]}"]:
+            self.tick_handlers[variant] = handler
 
     def start(self):
         self.connect()
 
     def connect(self):
-        url = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+        app_id = getattr(cfg, "APP_ID", 1089)
+        url = f"wss://ws.derivws.com/websockets/v3?app_id={app_id}"
         self.is_running = True
 
         def run():
@@ -144,13 +135,12 @@ class DerivClient:
                         on_error=self.on_error,
                         on_close=self.on_close
                     )
-                    self.ws.run_forever(ping_interval=25, ping_timeout=10)
+                    self.ws.run_forever(ping_interval=20, ping_timeout=10)
                 except Exception as e:
                     logger.error(f"Deriv WebSocket connection error: {e}")
 
                 self.connected = False
                 if self.is_running:
-                    logger.info("Reconnecting to Deriv in 5 seconds...")
                     time.sleep(5)
 
         threading.Thread(target=run, daemon=True).start()
@@ -158,20 +148,28 @@ class DerivClient:
     def on_open(self, ws):
         logger.info("Connected to Deriv API successfully.")
         self.connected = True
-        if API_TOKEN:
-            auth_req = {"authorize": API_TOKEN}
+        api_token = getattr(cfg, "API_TOKEN", None)
+        if api_token:
+            auth_req = {"authorize": api_token}
             try:
                 ws.send(json.dumps(auth_req))
-            except Exception as e:
-                logger.error(f"Failed to send authorization: {e}")
+            except Exception:
+                pass
 
         self.subscribe_symbols(ws)
 
     def subscribe_symbols(self, ws):
-        logger.info(f"ACTIVE_SYMBOL_DIAGNOSTIC: Subscribing to {len(ACTIVE_SYMBOLS)} pairs.")
-        for symbol in ACTIVE_SYMBOLS:
-            clean_symbol = symbol.replace("frx", "")
-            for target_sym in [f"frx{clean_symbol}", clean_symbol]:
+        # Merge symbols from both FOREX_PAIRS and ACTIVE_SYMBOLS
+        pairs_to_sub = set()
+        if hasattr(cfg, "FOREX_PAIRS") and isinstance(cfg.FOREX_PAIRS, dict):
+            pairs_to_sub.update(cfg.FOREX_PAIRS.keys())
+        if hasattr(cfg, "ACTIVE_SYMBOLS"):
+            pairs_to_sub.update(cfg.ACTIVE_SYMBOLS)
+
+        logger.info(f"DerivClient: Subscribing to live ticks for {len(pairs_to_sub)} pairs.")
+        for symbol in pairs_to_sub:
+            clean = symbol.replace("frx", "").replace("/", "").upper()
+            for target_sym in [f"frx{clean}", clean]:
                 req = {"ticks": target_sym, "subscribe": 1}
                 try:
                     ws.send(json.dumps(req))
@@ -193,12 +191,14 @@ class DerivClient:
                     quote = float(tick.get("quote", 0.0))
 
                     self.server_time = epoch
+                    clean = symbol.replace("frx", "").replace("/", "").upper()
 
-                    clean = symbol.replace("frx", "")
+                    # Find corresponding handler
                     handler = (
                         self.tick_handlers.get(symbol)
                         or self.tick_handlers.get(clean)
                         or self.tick_handlers.get(f"frx{clean}")
+                        or self.tick_handlers.get(f"{clean[:3]}/{clean[3:]}")
                     )
 
                     if handler:
@@ -230,31 +230,18 @@ class DerivClient:
                     self._pending_requests[req_id].set()
 
             elif msg_type == "error":
-                err = data.get("error", {})
-                err_code = err.get("code")
-                err_msg = err.get("message")
-                logger.warning(f"DerivClient API Error [{err_code}]: {err_msg} (req_id={req_id})")
-
                 if req_id is not None and req_id in self._pending_requests:
                     self._request_results[req_id] = []
                     self._pending_requests[req_id].set()
-
-            elif msg_type == "authorize":
-                if data.get("authorize"):
-                    logger.info("Deriv API Authorization Successful.")
-                else:
-                    logger.warning("Deriv API Authorization Failed.")
 
         except Exception as e:
             logger.error(f"Error processing Deriv message: {e}")
 
     def on_error(self, ws, error):
         self.connected = False
-        logger.error(f"Deriv WebSocket Error: {error}")
 
     def on_close(self, ws, close_status_code, close_msg):
         self.connected = False
-        logger.warning(f"Deriv WebSocket closed. Code: {close_status_code}, Message: {close_msg}")
 
     def disconnect(self):
         self.is_running = False

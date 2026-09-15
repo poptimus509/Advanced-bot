@@ -280,6 +280,17 @@ def live_quote(symbol):
                 quote = live_state[v]
                 break
         if quote is None:
+            # Fallback to latest closed candle price if live tick is momentarily delayed
+            manager = candle_managers.get(symbol)
+            if manager:
+                last_c = manager.get_latest_closed_candle("1M")
+                if last_c:
+                    quote = {
+                        "epoch": int(last_c.close_epoch),
+                        "price": float(last_c.close),
+                        "receipt": time.monotonic()
+                    }
+        if quote is None:
             return None
         quote = dict(quote)
 
@@ -290,7 +301,7 @@ def live_quote(symbol):
     server_age = server_time - quote["epoch"]
     receipt_age = time.monotonic() - quote["receipt"]
 
-    stale_sec = getattr(cfg, "STALE_TICK_THRESHOLD_SEC", 30)
+    stale_sec = getattr(cfg, "STALE_TICK_THRESHOLD_SEC", 60)
 
     if abs(server_age) > stale_sec or receipt_age > stale_sec:
         return None
@@ -323,7 +334,7 @@ def history_snapshot(symbol):
         if window is None or not window.get("complete", False):
             return float("nan")
         end_gap = epoch + 60 - window["last"]
-        if end_gap > getattr(cfg, "STALE_TICK_THRESHOLD_SEC", 30):
+        if end_gap > getattr(cfg, "STALE_TICK_THRESHOLD_SEC", 60):
             return float("nan")
         return float(window["count"])
 
@@ -340,11 +351,20 @@ def feed_diagnostics(symbol):
             if v in live_state:
                 quote = live_state[v]
                 break
-        quote = dict(quote) if quote else None
-
+        
         manager = candle_managers.get(symbol)
         candle = manager.get_latest_closed_candle("1M") if manager else None
         last_close = int(candle.close_epoch) if candle else None
+
+        # Auto fallback quote from last candle close if tick stream is silent
+        if quote is None and candle:
+            quote = {
+                "epoch": last_close,
+                "price": float(candle.close),
+                "receipt": time.monotonic()
+            }
+
+        quote = dict(quote) if quote else None
 
     now = deriv_client.get_server_time()
 
@@ -653,6 +673,14 @@ def resync_historical_candles():
 
             with state_lock:
                 manager.seed_historical_candles("1M", raw, server_epoch)
+                # Prime live quote using the latest candle
+                if raw:
+                    last_c = raw[-1]
+                    clean = symbol.replace("frx", "").replace("/", "").upper()
+                    ep = int(last_c.get("epoch") or last_c.get("time") or server_epoch)
+                    cl = float(last_c.get("close", 0))
+                    for k in [symbol, clean, f"frx{clean}"]:
+                        live_state[k] = {"epoch": ep, "price": cl, "receipt": time.monotonic()}
             updated += 1
 
         logger.info("M1 history refreshed for %s/%s pairs.", updated, len(cfg.FOREX_PAIRS))

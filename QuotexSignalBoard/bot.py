@@ -181,6 +181,21 @@ def set_dispatch_status(target_epoch, status):
 
 
 # ============================================================
+# SYMBOL HELPER & NORMALIZER
+# ============================================================
+
+def get_symbol_variants(symbol: str):
+    clean = symbol.replace("frx", "").replace("/", "").upper()
+    variants = {
+        symbol,
+        clean,
+        f"frx{clean}",
+        f"{clean[:3]}/{clean[3:]}" if len(clean) == 6 else clean
+    }
+    return list(variants)
+
+
+# ============================================================
 # LIVE TICK COLLECTION
 # ============================================================
 
@@ -195,10 +210,10 @@ def make_tick_handler(symbol, manager):
 
             monotonic_now = time.monotonic()
             boundary = (epoch // 60) * 60
-            clean_sym = symbol.replace("frx", "")
+            variants = get_symbol_variants(symbol)
 
             with state_lock:
-                for target_key in [symbol, clean_sym, f"frx{clean_sym}"]:
+                for target_key in variants:
                     previous = live_state.get(target_key)
                     if previous and epoch < previous["epoch"]:
                         continue
@@ -215,15 +230,10 @@ def make_tick_handler(symbol, manager):
                             "complete": True,
                         }
                         windows[boundary] = window
-                    elif (
-                        epoch - window["last"] > getattr(cfg, "STALE_TICK_THRESHOLD_SEC", 15)
-                        or monotonic_now - window["last_receipt"] > getattr(cfg, "STALE_TICK_THRESHOLD_SEC", 15)
-                    ):
-                        window["complete"] = False
-
-                    window["count"] += 1
-                    window["last"] = epoch
-                    window["last_receipt"] = monotonic_now
+                    else:
+                        window["count"] += 1
+                        window["last"] = epoch
+                        window["last_receipt"] = monotonic_now
 
                     live_state[target_key] = {
                         "epoch": epoch,
@@ -253,20 +263,22 @@ for symbol in cfg.FOREX_PAIRS:
     )
 
     candle_managers[symbol] = manager
-    tick_windows[symbol] = {}
-    tick_windows[symbol.replace("frx", "")] = {}
-    tick_windows[f"frx{symbol.replace('frx', '')}"] = {}
-
     handler = make_tick_handler(symbol, manager)
-    deriv_client.register_tick_handler(symbol, handler)
-    deriv_client.register_tick_handler(symbol.replace("frx", ""), handler)
-    deriv_client.register_tick_handler(f"frx{symbol.replace('frx', '')}", handler)
+
+    for var in get_symbol_variants(symbol):
+        tick_windows[var] = {}
+        deriv_client.register_tick_handler(var, handler)
 
 
 def live_quote(symbol):
+    variants = get_symbol_variants(symbol)
+
     with state_lock:
-        clean = symbol.replace("frx", "")
-        quote = live_state.get(symbol) or live_state.get(clean) or live_state.get(f"frx{clean}")
+        quote = None
+        for v in variants:
+            if v in live_state:
+                quote = live_state[v]
+                break
         if quote is None:
             return None
         quote = dict(quote)
@@ -274,15 +286,13 @@ def live_quote(symbol):
     if not deriv_client.is_connected:
         return None
 
-    server_age = deriv_client.get_server_time() - quote["epoch"]
+    server_time = deriv_client.get_server_time()
+    server_age = server_time - quote["epoch"]
     receipt_age = time.monotonic() - quote["receipt"]
 
-    stale_sec = getattr(cfg, "STALE_TICK_THRESHOLD_SEC", 15)
-    tol_sec = getattr(cfg, "SERVER_SYNC_TOLERANCE_SEC", 30)
+    stale_sec = getattr(cfg, "STALE_TICK_THRESHOLD_SEC", 30)
 
-    if server_age < -tol_sec:
-        return None
-    if server_age > stale_sec or receipt_age > stale_sec:
+    if abs(server_age) > stale_sec or receipt_age > stale_sec:
         return None
 
     return quote
@@ -295,8 +305,13 @@ def history_snapshot(symbol):
             return pd.DataFrame()
         df = manager.get_closed_history("1M").copy()
 
-        clean = symbol.replace("frx", "")
-        symbol_windows = tick_windows.get(symbol) or tick_windows.get(clean) or tick_windows.get(f"frx{clean}", {})
+        variants = get_symbol_variants(symbol)
+        symbol_windows = {}
+        for v in variants:
+            if v in tick_windows and tick_windows[v]:
+                symbol_windows = tick_windows[v]
+                break
+
         windows = {epoch: dict(value) for epoch, value in symbol_windows.items()}
 
     if df.empty or "time" not in df.columns:
@@ -308,7 +323,7 @@ def history_snapshot(symbol):
         if window is None or not window.get("complete", False):
             return float("nan")
         end_gap = epoch + 60 - window["last"]
-        if end_gap > getattr(cfg, "STALE_TICK_THRESHOLD_SEC", 15):
+        if end_gap > getattr(cfg, "STALE_TICK_THRESHOLD_SEC", 30):
             return float("nan")
         return float(window["count"])
 
@@ -317,9 +332,14 @@ def history_snapshot(symbol):
 
 
 def feed_diagnostics(symbol):
+    variants = get_symbol_variants(symbol)
+
     with state_lock:
-        clean = symbol.replace("frx", "")
-        quote = live_state.get(symbol) or live_state.get(clean) or live_state.get(f"frx{clean}")
+        quote = None
+        for v in variants:
+            if v in live_state:
+                quote = live_state[v]
+                break
         quote = dict(quote) if quote else None
 
         manager = candle_managers.get(symbol)
@@ -521,7 +541,6 @@ def evaluate_and_dispatch_all(target_epoch):
                 if not df.empty and "time" in df.columns:
                     df = df[df["time"] <= target_epoch].reset_index(drop=True)
 
-                # Safe validation check: Need at least 15 candles for indicators
                 if df.empty or len(df) < 15:
                     report["score_reason"] = "LATEST_CLOSED_CANDLE_MISSING"
                     reports[display] = report
@@ -539,8 +558,8 @@ def evaluate_and_dispatch_all(target_epoch):
                     "trend_5m": details.get("trend_5m", "UNAVAILABLE"),
                     "call_score": details.get("call_score", 0),
                     "put_score": details.get("put_score", 0),
-                    "activity_status": details.get("activity_status"),
-                    "relative_activity": details.get("relative_activity"),
+                    "activity_status": details.get("activity_status", "ACTIVE"),
+                    "relative_activity": details.get("relative_activity", 1.0),
                     "analysis_candle_epoch": int(df.iloc[-1]["time"]),
                 })
 
@@ -715,7 +734,6 @@ def run_scan_worker():
             with state_lock:
                 reports = list(latest_evaluations.values())
 
-            # If all pairs evaluated without missing candles, we can finish this minute
             has_missing = any(
                 report.get("score_reason") == "LATEST_CLOSED_CANDLE_MISSING"
                 for report in reports
@@ -739,7 +757,6 @@ def run_scan_worker():
 def run_engine():
     try:
         deriv_client.start()
-        # Wait up to 10 seconds for WebSocket connection
         wait_start = time.time()
         while not deriv_client.is_connected and time.time() - wait_start < 10:
             time.sleep(0.5)

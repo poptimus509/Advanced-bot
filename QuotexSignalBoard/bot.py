@@ -19,7 +19,7 @@ from data.candle_manager import CandleManager
 from data.deriv_client import DerivClient
 from database import get_db_connection, init_db
 from monitor import get_today_performance
-from strategy import evaluate_strategy, prepare_history
+from strategy import evaluate_strategy
 
 
 # ============================================================
@@ -53,6 +53,66 @@ deriv_client = DerivClient()
 
 candle_managers = {}
 live_state = {}
+
+# ============================================================
+# EVENT-DRIVEN FAST PATH
+# ------------------------------------------------------------
+# CandleManager already fires a CandleClosedEvent the INSTANT a symbol's
+# closing tick for a 1M boundary arrives (see data/candle_manager.py). That
+# event was previously never subscribed to anywhere, so the only way a
+# signal could go out was the polling loop below (run_scan_worker), which
+# deliberately waits until second>=2 of the new minute and then re-checks
+# every ~2 seconds. That is where most of the "signal came late into the
+# minute" delay comes from.
+#
+# Here we subscribe to that event so the very first 1M candle-close of a
+# new minute schedules a short debounce (to let the other ~15 pairs' own
+# closing ticks land, since they don't all arrive in the same millisecond),
+# then runs the scan immediately - typically well under a second after the
+# minute actually starts, instead of >=2 seconds (best case) or up to 45
+# seconds (if the first few polling attempts found nothing yet).
+#
+# The polling loop is kept running unmodified as a safety net: if the event
+# path never fires for some reason (a dropped tick, a reconnect edge case),
+# the old behaviour still applies and no signal is silently lost.
+# ============================================================
+
+MINUTE_DEBOUNCE_SECONDS = 0.4
+
+_pending_minute_lock = threading.Lock()
+_minute_debounce_timers = {}
+
+
+def _fire_minute_scan(target_minute):
+    with _pending_minute_lock:
+        _minute_debounce_timers.pop(target_minute, None)
+
+    if minute_has_dispatch_attempt(target_minute):
+        return
+    try:
+        evaluate_and_dispatch_all(target_minute)
+    except Exception:
+        logger.exception("Event-driven scan failed for minute %s", target_minute)
+
+
+def _on_candle_closed(event):
+    if event.timeframe != "1M":
+        return
+
+    target_minute = event.candle_epoch + 60  # the minute that just started trading
+
+    with _pending_minute_lock:
+        if target_minute in _minute_debounce_timers:
+            return  # a scan for this minute is already scheduled
+        if minute_has_dispatch_attempt(target_minute):
+            return  # already resolved this minute, nothing left to do
+        timer = threading.Timer(MINUTE_DEBOUNCE_SECONDS, _fire_minute_scan, args=(target_minute,))
+        timer.daemon = True
+        _minute_debounce_timers[target_minute] = timer
+        timer.start()
+
+
+event_dispatcher.subscribe(_on_candle_closed)
 tick_windows = {}
 
 ready = threading.Event()
@@ -331,6 +391,20 @@ def history_snapshot(symbol):
     return df
 
 
+def history_snapshot_htf(symbol, timeframe):
+    """
+    Real 5M / 15M closed-candle history (CandleManager already builds these by
+    aggregating 1M candles - previously this data existed but was never read
+    by the evaluator, so the "5M/15M trend" shown in signals was actually just
+    a relabeled EMA computed on 1M closes).
+    """
+    with state_lock:
+        manager = candle_managers.get(symbol)
+        if not manager:
+            return pd.DataFrame()
+        return manager.get_closed_history(timeframe).copy()
+
+
 def feed_diagnostics(symbol):
     variants = get_symbol_variants(symbol)
 
@@ -386,8 +460,10 @@ def send_telegram_alert(candidate, target_epoch):
         f"🎯 Action: {candidate['direction']}\n"
         f"⭐️ Score: {candidate['score']}/10 ({candidate['quality']})\n"
         f"⏰ Expiry: {expiry.strftime('%H:%M:%S')} {getattr(cfg, 'TIMEZONE_NAME', 'Asia/Dhaka')}\n"
-        f"📈 5M Trend: {details.get('trend_5m', 'UNAVAILABLE')}\n"
-        f"💡 Reason: {details.get('score_reason', 'N/A')}\n\n"
+        f"📈 5M Bias: {details.get('trend_5m', 'UNAVAILABLE')}\n"
+        f"📈 15M Bias: {details.get('trend_15m', 'UNAVAILABLE')}\n"
+        f"🧱 S/R Context: {details.get('sr_context', 'UNAVAILABLE')}\n"
+        f"💡 1M Trigger: {details.get('score_reason', 'N/A')}\n\n"
         "Execution on Deriv quotation feed."
     )
 
@@ -519,18 +595,38 @@ def evaluate_and_dispatch_all(target_epoch):
             try:
                 report.update(feed_diagnostics(symbol))
 
+                # NOTE: evaluate_strategy() now prepares (EMA/RSI/ATR) each
+                # timeframe internally, so we pass raw closed-candle history
+                # here instead of pre-computing indicators ourselves.
                 raw_df = history_snapshot(symbol)
-                df = prepare_history(raw_df) if not raw_df.empty else raw_df
+                if not raw_df.empty and "time" in raw_df.columns:
+                    raw_df = raw_df[raw_df["time"] <= target_epoch].reset_index(drop=True)
 
-                if not df.empty and "time" in df.columns:
-                    df = df[df["time"] <= target_epoch].reset_index(drop=True)
-
-                if df.empty or len(df) < 15:
+                if raw_df.empty or len(raw_df) < 15:
                     report["score_reason"] = "LATEST_CLOSED_CANDLE_MISSING"
                     reports[display] = report
                     continue
 
-                direction, score, quality, details = evaluate_strategy(df)
+                latest_closed_epoch = int(raw_df.iloc[-1]["time"])
+                if latest_closed_epoch != target_epoch - 60:
+                    # This symbol's own closing tick for the boundary hasn't
+                    # landed yet - normal right after a fast, event-driven
+                    # scan fires for a sibling pair. Skip it THIS attempt;
+                    # its own CandleClosedEvent will trigger another attempt
+                    # a moment later if no signal has been dispatched yet.
+                    report["score_reason"] = "STALE_CANDLE_SKIPPED"
+                    reports[display] = report
+                    continue
+
+                raw_5m = history_snapshot_htf(symbol, "5M")
+                if not raw_5m.empty and "time" in raw_5m.columns:
+                    raw_5m = raw_5m[raw_5m["time"] <= target_epoch].reset_index(drop=True)
+
+                raw_15m = history_snapshot_htf(symbol, "15M")
+                if not raw_15m.empty and "time" in raw_15m.columns:
+                    raw_15m = raw_15m[raw_15m["time"] <= target_epoch].reset_index(drop=True)
+
+                direction, score, quality, details = evaluate_strategy(raw_df, raw_5m, raw_15m)
 
                 report.update({
                     "direction": direction,
@@ -540,11 +636,13 @@ def evaluate_and_dispatch_all(target_epoch):
                     "score_reason": details.get("score_reason", "EVALUATED"),
                     "structure": details.get("structure", "N/A"),
                     "trend_5m": details.get("trend_5m", "UNAVAILABLE"),
+                    "trend_15m": details.get("trend_15m", "UNAVAILABLE"),
+                    "sr_context": details.get("sr_context", "UNAVAILABLE"),
                     "call_score": details.get("call_score", 0),
                     "put_score": details.get("put_score", 0),
                     "activity_status": details.get("activity_status", "ACTIVE"),
                     "relative_activity": details.get("relative_activity", 1.0),
-                    "analysis_candle_epoch": int(df.iloc[-1]["time"]),
+                    "analysis_candle_epoch": int(raw_df.iloc[-1]["time"]),
                 })
 
                 if direction in ("CALL", "PUT"):
@@ -558,7 +656,7 @@ def evaluate_and_dispatch_all(target_epoch):
                             "score": score,
                             "quality": quality,
                             "details": details,
-                            "analysis_close": float(df.iloc[-1]["close"]),
+                            "analysis_close": float(raw_df.iloc[-1]["close"]),
                         })
 
             except Exception as exc:

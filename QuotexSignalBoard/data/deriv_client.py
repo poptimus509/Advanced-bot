@@ -30,10 +30,11 @@ class DerivClient:
         return self.connected
 
     def get_server_time(self):
-        return int(time.time())
+        # Use the latest broker epoch for candle boundaries after first tick.
+        return int(self.server_time or time.time())
 
     def fetch_server_epoch_sync(self):
-        return int(time.time())
+        return int(self.server_time or time.time())
 
     def _get_next_req_id(self) -> int:
         with self._req_lock:

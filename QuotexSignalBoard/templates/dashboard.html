@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quotex Forex Signal Board</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <header class="top-header">
+        <div class="logo-area">
+            <h1>FOREX SIGNAL BOARD</h1>
+            <span class="badge live">LIVE</span>
+        </div>
+        <div class="status-area">
+            <span id="connection-status" class="status-dot">Connecting...</span>
+            <span id="bdt-time">--:--:-- BDT</span>
+        </div>
+    </header>
+
+    <main class="main-container">
+        <!-- Active Signals Banner -->
+        <section class="active-signals-section">
+            <h2>ACTIVE SIGNALS (5M / 1M Expiry)</h2>
+            <div id="active-signals-grid" class="active-grid">
+                <div class="no-signal-card">Waiting for high-confluence signals...</div>
+            </div>
+        </section>
+
+        <!-- Stats Overview -->
+        <section class="stats-section">
+            <div class="stat-card">
+                <h3>Total Signals</h3>
+                <p id="stat-total">0</p>
+            </div>
+            <div class="stat-card">
+                <h3>Settled</h3>
+                <p id="stat-settled">0</p>
+            </div>
+            <div class="stat-card">
+                <h3>Wins / Losses</h3>
+                <p><span id="stat-wins" class="text-success">0</span> / <span id="stat-losses" class="text-danger">0</span></p>
+            </div>
+            <div class="stat-card">
+                <h3>Settled Win Rate</h3>
+                <p id="stat-winrate" class="text-highlight">0.00%</p>
+            </div>
+        </section>
+
+        <!-- 16 Pairs Live Grid -->
+        <section class="pairs-section">
+            <h2>16 Forex Pairs Registry</h2>
+            <div class="table-responsive">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Pair</th>
+                            <th>Current Price</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pairs-table-body">
+                        <tr><td colspan="3" class="text-center">Loading pairs...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- Signal History -->
+        <section class="history-section">
+            <h2>Signal History & Outcomes</h2>
+            <div class="table-responsive">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Time (BDT)</th>
+                            <th>Pair</th>
+                            <th>Direction</th>
+                            <th>Score</th>
+                            <th>Quality</th>
+                            <th>15M Bias</th>
+                            <th>Entry</th>
+                            <th>Expiry</th>
+                            <th>Result</th>
+                        </tr>
+                    </thead>
+                    <tbody id="history-table-body">
+                        <tr><td colspan="9" class="text-center">No history available yet.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <script>
+        document.addEventListener("DOMContentLoaded", () => {
+            function updateTime() {
+                const now = new Date();
+                const options = { timeZone: 'Asia/Dhaka', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' };
+                const timeEl = document.getElementById('bdt-time');
+                if (timeEl) {
+                    timeEl.innerText = now.toLocaleTimeString('en-GB', options) + " BDT";
+                }
+            }
+            setInterval(updateTime, 1000);
+
+            async function fetchDashboardData() {
+                try {
+                    const res = await fetch('/api/dashboard');
+                    const data = await res.json();
+                    
+                    const connEl = document.getElementById('connection-status');
+                    if (connEl) {
+                        if (data.deriv_connected) {
+                            connEl.innerText = "Deriv Connected";
+                            connEl.className = "status-dot online";
+                        } else {
+                            connEl.innerText = "Disconnected";
+                            connEl.className = "status-dot offline";
+                        }
+                    }
+
+                    const p = data.performance;
+                    if (p) {
+                        const totalEl = document.getElementById('stat-total');
+                        const settledEl = document.getElementById('stat-settled');
+                        const winsEl = document.getElementById('stat-wins');
+                        const lossesEl = document.getElementById('stat-losses');
+                        const winrateEl = document.getElementById('stat-winrate');
+
+                        if (totalEl) totalEl.innerText = p.total || 0;
+                        if (settledEl) settledEl.innerText = p.settled || 0;
+                        if (winsEl) winsEl.innerText = p.wins || 0;
+                        if (lossesEl) lossesEl.innerText = p.losses || 0;
+                        if (winrateEl) winrateEl.innerText = (p.win_rate || 0) + '%';
+                    }
+
+                    const historyRes = await fetch('/api/history');
+                    const historyData = await historyRes.json();
+                    const historyBody = document.getElementById('history-table-body');
+                    if (historyBody && historyData && historyData.length > 0) {
+                        historyBody.innerHTML = historyData.map(row => `
+                            <tr>
+                                <td>${row.timestamp ? row.timestamp.substring(11, 19) : '--'}</td>
+                                <td><strong>${row.pair}</strong></td>
+                                <td><span class="badge ${row.direction.toLowerCase()}">${row.direction}</span></td>
+                                <td>${row.score}/11</td>
+                                <td>${row.quality}</td>
+                                <td>${row.bias}</td>
+                                <td>${row.price ? row.price.toFixed(5) : '--'}</td>
+                                <td>${row.exit_price ? row.exit_price.toFixed(5) : '--'}</td>
+                                <td><span class="result-badge ${row.result.toLowerCase()}">${row.result}</span></td>
+                            </tr>
+                        `).join('');
+                    }
+                } catch (e) {
+                    console.error("Dashboard fetch error:", e);
+                }
+            }
+
+            async function fetchActiveSignals() {
+                try {
+                    const res = await fetch('/api/active-signals');
+                    const actives = await res.json();
+                    const grid = document.getElementById('active-signals-grid');
+                    
+                    if (grid) {
+                        if (!actives || actives.length === 0) {
+                            grid.innerHTML = '<div class="no-signal-card">Waiting for high-confluence signals...</div>';
+                            return;
+                        }
+
+                        grid.innerHTML = actives.map(sig => `
+                            <div class="signal-card ${sig.direction.toLowerCase()}">
+                                <div class="card-header">
+                                    <span class="pair-name">${sig.pair}</span>
+                                    <span class="badge ${sig.direction.toLowerCase()}">${sig.direction}</span>
+                                </div>
+                                <div class="card-body">
+                                    <p>Score: <strong>${sig.score}/11</strong> (${sig.quality})</p>
+                                    <p>15M Bias: <strong>${sig.bias}</strong></p>
+                                    <p>Entry: <strong>${sig.price ? sig.price.toFixed(5) : '--'}</strong></p>
+                                    <p class="status-pending">Status: PENDING (1M Expiry)</p>
+                                </div>
+                            </div>
+                        `).join('');
+                    }
+                } catch (e) {
+                    console.error("Active signals fetch error:", e);
+                }
+            }
+
+            async function fetchPairs() {
+                try {
+                    const res = await fetch('/api/pairs');
+                    const pairs = await res.json();
+                    const tbody = document.getElementById('pairs-table-body');
+                    
+                    if (tbody) {
+                        const pairsArray = Array.isArray(pairs) ? pairs : Object.entries(pairs).map(([key, value]) => ({ symbol: key, display: value }));
+
+                        tbody.innerHTML = pairsArray.map(p => `
+                            <tr>
+                                <td><strong>${p.display || p.symbol}</strong></td>
+                                <td>--</td>
+                                <td><span class="status-dot online"></span> ACTIVE</td>
+                            </tr>
+                        `).join('');
+                    }
+                } catch (e) {
+                    console.error("Pairs fetch error:", e);
+                }
+            }
+
+            setInterval(fetchDashboardData, 5000);
+            setInterval(fetchActiveSignals, 3000);
+            setInterval(fetchPairs, 3000);
+
+            fetchDashboardData();
+            fetchActiveSignals();
+            fetchPairs();
+        });
+    </script>
+</body>
+</html>

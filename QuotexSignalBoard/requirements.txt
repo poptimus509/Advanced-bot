@@ -1,0 +1,12 @@
+flask
+gunicorn
+fastapi
+uvicorn
+websockets
+websocket-client
+pandas
+numpy
+requests
+python-telegram-bot
+pusher
+pytz

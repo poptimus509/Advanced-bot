@@ -381,13 +381,13 @@ def send_telegram_alert(candidate, target_epoch):
     details = candidate["details"]
 
     message = (
-        "⚡️ MARKET ANALYSIS SIGNAL ⚡️\n\n"
-        f"📊 Pair: {candidate['display_name']}\n"
-        f"🎯 Action: {candidate['direction']}\n"
-        f"⭐️ Score: {candidate['score']}/10 ({candidate['quality']})\n"
-        f"⏰ Expiry: {expiry.strftime('%H:%M:%S')} {getattr(cfg, 'TIMEZONE_NAME', 'Asia/Dhaka')}\n"
-        f"📈 5M Trend: {details.get('trend_5m', 'UNAVAILABLE')}\n"
-        f"💡 Reason: {details.get('score_reason', 'N/A')}\n\n"
+        "âš¡ï¸ MARKET ANALYSIS SIGNAL âš¡ï¸\n\n"
+        f"ðŸ“Š Pair: {candidate['display_name']}\n"
+        f"ðŸŽ¯ Action: {candidate['direction']}\n"
+        f"â­ï¸ Score: {candidate['score']}/10 ({candidate['quality']})\n"
+        f"â° Expiry: {expiry.strftime('%H:%M:%S')} {getattr(cfg, 'TIMEZONE_NAME', 'Asia/Dhaka')}\n"
+        f"ðŸ“ˆ 5M Trend: {details.get('trend_5m', 'UNAVAILABLE')}\n"
+        f"ðŸ’¡ Reason: {details.get('score_reason', 'N/A')}\n\n"
         "Execution on Deriv quotation feed."
     )
 
@@ -695,13 +695,13 @@ def run_scan_worker():
                 time.sleep(0.5)
                 continue
 
-            if second > 8:
+            if second > 4:
                 finished_minute = minute
                 time.sleep(0.5)
                 continue
 
-            if second < 1:
-                time.sleep(0.2)
+            if second < 0.8:
+                time.sleep(0.1)
                 continue
 
             if minute_has_dispatch_attempt(minute):

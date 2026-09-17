@@ -807,7 +807,8 @@ def run_scan_worker():
             # Dispatch only at the beginning of the target candle.
             if second <= 10.0 and dispatched_minute != minute:
                 logger.info("Dispatch window: candle=%s second=%.2f", minute, second)
-                if dispatch_pending_candidates(minute):
+                sent = dispatch_pending_candidates(minute)
+                if sent or not pending_candidates.get(minute):
                     dispatched_minute = minute
 
             time.sleep(0.2)

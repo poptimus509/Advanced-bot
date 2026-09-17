@@ -315,6 +315,18 @@ def evaluate_strategy(df: pd.DataFrame, df5: Optional[pd.DataFrame] = None,
         direction = "NO_TRADE"
         score_reason = "+".join(reasons[:2]) if reasons else "WAITING_SETUP"
 
+    # Hard 1M reversal veto. Higher-timeframe bullishness must not keep
+    # emitting CALL after the short-term market has visibly turned bearish.
+    last3 = df.tail(3)
+    bearish_1m_reversal = len(last3) >= 2 and int((last3["close"] < last3["open"]).sum()) >= 2
+    bullish_1m_reversal = len(last3) >= 2 and int((last3["close"] > last3["open"]).sum()) >= 2
+    if direction == "CALL" and bearish_1m_reversal:
+        direction = "NO_TRADE"
+        score_reason = "M1_BEARISH_REVERSAL_VETO"
+    elif direction == "PUT" and bullish_1m_reversal:
+        direction = "NO_TRADE"
+        score_reason = "M1_BULLISH_REVERSAL_VETO"
+
     details = {
         "score_reason": score_reason,
         "structure": structure,

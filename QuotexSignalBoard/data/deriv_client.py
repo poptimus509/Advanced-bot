@@ -21,6 +21,7 @@ class DerivClient:
         self.tick_handlers = {}
         self.last_tick_wall_time = time.time()
         self._watchdog_started = False
+        self._poller_started = False
         
         # Concurrency & request tracking
         self._req_id_counter = 0
@@ -148,6 +149,14 @@ class DerivClient:
                 name="DerivTickWatchdog",
             ).start()
 
+        if not self._poller_started:
+            self._poller_started = True
+            threading.Thread(
+                target=self._history_fallback_loop,
+                daemon=True,
+                name="DerivHistoryFallback",
+            ).start()
+
         def run():
             while self.is_running:
                 try:
@@ -187,6 +196,61 @@ class DerivClient:
                         self.ws.close()
                 except Exception:
                     pass
+
+    def _history_fallback_loop(self):
+        """Keep candle managers alive when Deriv tick subscriptions go silent."""
+        while self.is_running:
+            if not self.connected or not self.ws:
+                time.sleep(2.0)
+                continue
+
+            symbols = set()
+            if isinstance(getattr(cfg, "FOREX_PAIRS", None), dict):
+                symbols.update(cfg.FOREX_PAIRS.keys())
+            symbols.update(getattr(cfg, "ACTIVE_SYMBOLS", []))
+
+            for symbol in symbols:
+                if not self.is_running or not self.connected or not self.ws:
+                    break
+                clean = symbol.replace("frx", "").replace("/", "").upper()
+                req_id = self._get_next_req_id()
+                event = threading.Event()
+                self._pending_requests[req_id] = event
+                request = {
+                    "ticks_history": f"frx{clean}",
+                    "adjust_start_time": 1,
+                    "count": 2,
+                    "end": "latest",
+                    "granularity": 60,
+                    "style": "candles",
+                    "req_id": req_id,
+                }
+                try:
+                    self.ws.send(json.dumps(request))
+                    if event.wait(timeout=2.0):
+                        candles = self._request_results.pop(req_id, [])
+                        if candles:
+                            candle = candles[-1]
+                            candle_epoch = int(candle.get("epoch", candle.get("time", 0)))
+                            close = float(candle.get("close", 0.0))
+                            if candle_epoch and close > 0:
+                                # Feed the candle close as a synthetic quote.
+                                # CandleManager will close the prior candle when
+                                # the next candle boundary is reached.
+                                handler = (
+                                    self.tick_handlers.get(f"frx{clean}")
+                                    or self.tick_handlers.get(clean)
+                                )
+                                if handler:
+                                    handler(candle_epoch + 59, close, time.monotonic())
+                except Exception as exc:
+                    logger.debug("History fallback failed for %s: %s", symbol, exc)
+                finally:
+                    self._pending_requests.pop(req_id, None)
+                    self._request_results.pop(req_id, None)
+                time.sleep(0.12)
+
+            time.sleep(3.0)
 
     def on_open(self, ws):
         logger.info("Connected to Deriv API successfully.")

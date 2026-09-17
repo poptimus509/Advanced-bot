@@ -17,6 +17,7 @@ class DerivClient:
         self.subscribed_symbols = set()
         self.server_time = int(time.time())
         self.connected = False
+        self.authorized = False
         self.tick_handlers = {}
         self.last_tick_wall_time = time.time()
         self._watchdog_started = False
@@ -190,6 +191,7 @@ class DerivClient:
     def on_open(self, ws):
         logger.info("Connected to Deriv API successfully.")
         self.connected = True
+        self.authorized = False
         self.last_tick_wall_time = time.time()
         api_token = getattr(cfg, "API_TOKEN", None)
         if api_token:
@@ -199,7 +201,8 @@ class DerivClient:
             except Exception:
                 pass
 
-        self.subscribe_symbols(ws)
+        else:
+            self.subscribe_symbols(ws)
 
     def subscribe_symbols(self, ws):
         # Merge symbols from both FOREX_PAIRS and ACTIVE_SYMBOLS
@@ -228,6 +231,20 @@ class DerivClient:
             data = json.loads(message)
             msg_type = data.get("msg_type")
             req_id = data.get("req_id")
+
+            if msg_type == "authorize":
+                self.authorized = True
+                logger.info("Deriv authorization successful; subscribing to live ticks.")
+                self.subscribe_symbols(ws)
+                return
+
+            if msg_type == "error":
+                err = data.get("error", {})
+                logger.error(
+                    "Deriv API error: %s - %s",
+                    err.get("code", "UNKNOWN"),
+                    err.get("message", data),
+                )
 
             if msg_type == "tick":
                 tick = data.get("tick")

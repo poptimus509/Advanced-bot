@@ -95,12 +95,12 @@ def init_dispatch_ledger():
     try:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS dispatch_ledger_v2 (
-                target_epoch INTEGER PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS dispatch_ledger_v3 (
+                target_epoch INTEGER NOT NULL,
                 symbol TEXT NOT NULL,
                 setup_id TEXT NOT NULL,
                 status TEXT NOT NULL,
-                UNIQUE(symbol, setup_id)
+                PRIMARY KEY (target_epoch, symbol)
             )
             """
         )
@@ -118,7 +118,7 @@ def used_setup(symbol, setup_id):
         row = conn.execute(
             """
             SELECT 1
-            FROM dispatch_ledger_v2
+            FROM dispatch_ledger_v3
             WHERE symbol = ? AND setup_id = ?
             """,
             (symbol, setup_id),
@@ -134,7 +134,7 @@ def minute_has_dispatch_attempt(target_epoch):
         row = conn.execute(
             """
             SELECT 1
-            FROM dispatch_ledger_v2
+            FROM dispatch_ledger_v3
             WHERE target_epoch = ?
             """,
             (target_epoch,),
@@ -149,7 +149,7 @@ def reserve_dispatch(symbol, setup_id, target_epoch):
     try:
         conn.execute(
             """
-            INSERT INTO dispatch_ledger_v2 (
+            INSERT INTO dispatch_ledger_v3 (
                 target_epoch,
                 symbol,
                 setup_id,
@@ -165,13 +165,13 @@ def reserve_dispatch(symbol, setup_id, target_epoch):
         # A previous attempt for this candle may have failed or been
         # interrupted. Allow retry unless Telegram already confirmed SENT.
         row = conn.execute(
-            "SELECT status FROM dispatch_ledger_v2 WHERE target_epoch = ?",
-            (target_epoch,),
+            "SELECT status FROM dispatch_ledger_v3 WHERE target_epoch = ? AND symbol = ?",
+            (target_epoch, symbol),
         ).fetchone()
         if row and row[0] != "SENT":
             conn.execute(
-                "UPDATE dispatch_ledger_v2 SET symbol = ?, setup_id = ?, status = 'ATTEMPTING' WHERE target_epoch = ?",
-                (symbol, setup_id, target_epoch),
+                "UPDATE dispatch_ledger_v3 SET setup_id = ?, status = 'ATTEMPTING' WHERE target_epoch = ? AND symbol = ?",
+                (setup_id, target_epoch, symbol),
             )
             conn.commit()
             return True
@@ -185,7 +185,7 @@ def set_dispatch_status(target_epoch, status):
     try:
         conn.execute(
             """
-            UPDATE dispatch_ledger_v2
+            UPDATE dispatch_ledger_v3
             SET status = ?
             WHERE target_epoch = ?
             """,

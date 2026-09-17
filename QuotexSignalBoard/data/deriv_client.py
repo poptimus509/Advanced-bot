@@ -18,6 +18,8 @@ class DerivClient:
         self.server_time = int(time.time())
         self.connected = False
         self.tick_handlers = {}
+        self.last_tick_wall_time = time.time()
+        self._watchdog_started = False
         
         # Concurrency & request tracking
         self._req_id_counter = 0
@@ -125,6 +127,14 @@ class DerivClient:
         url = f"wss://ws.derivws.com/websockets/v3?app_id={app_id}"
         self.is_running = True
 
+        if not self._watchdog_started:
+            self._watchdog_started = True
+            threading.Thread(
+                target=self._tick_watchdog,
+                daemon=True,
+                name="DerivTickWatchdog",
+            ).start()
+
         def run():
             while self.is_running:
                 try:
@@ -146,9 +156,29 @@ class DerivClient:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _tick_watchdog(self):
+        while self.is_running:
+            time.sleep(5)
+            if not self.connected:
+                continue
+
+            silence = time.time() - self.last_tick_wall_time
+            if silence > 20:
+                logger.warning(
+                    "No Deriv tick received for %.1f seconds; reconnecting WebSocket.",
+                    silence,
+                )
+                self.connected = False
+                try:
+                    if self.ws:
+                        self.ws.close()
+                except Exception:
+                    pass
+
     def on_open(self, ws):
         logger.info("Connected to Deriv API successfully.")
         self.connected = True
+        self.last_tick_wall_time = time.time()
         api_token = getattr(cfg, "API_TOKEN", None)
         if api_token:
             auth_req = {"authorize": api_token}
@@ -187,6 +217,7 @@ class DerivClient:
             if msg_type == "tick":
                 tick = data.get("tick")
                 if tick:
+                    self.last_tick_wall_time = time.time()
                     symbol = str(tick.get("symbol", ""))
                     epoch = int(tick.get("epoch", time.time()))
                     quote = float(tick.get("quote", 0.0))

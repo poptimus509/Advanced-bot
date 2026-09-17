@@ -655,10 +655,10 @@ def evaluate_and_dispatch_all(target_epoch, dispatch=True):
 
 def dispatch_pending_candidates(target_epoch):
     with state_lock:
-        candidates = pending_candidates.pop(target_epoch, [])
+        candidates = list(pending_candidates.get(target_epoch, []))
 
     if not candidates or not cfg.SIGNALS_ENABLED:
-        return
+        return False
 
     for candidate in candidates:
         status = dispatch_best_signal(candidate, target_epoch)
@@ -667,9 +667,13 @@ def dispatch_pending_candidates(target_epoch):
             if report is not None:
                 report["delivery"] = status
         if status == "SENT":
-            break
+            with state_lock:
+                pending_candidates.pop(target_epoch, None)
+            return True
         if status != "DUPLICATE":
-            break
+            return False
+
+    return False
 
 
 # ============================================================
@@ -776,9 +780,9 @@ def run_scan_worker():
 
             # Dispatch only at the beginning of the target candle.
             if second <= 7.0 and dispatched_minute != minute:
-                dispatched_minute = minute
                 logger.info("Dispatch window: candle=%s second=%.2f", minute, second)
-                dispatch_pending_candidates(minute)
+                if dispatch_pending_candidates(minute):
+                    dispatched_minute = minute
 
             time.sleep(0.2)
 

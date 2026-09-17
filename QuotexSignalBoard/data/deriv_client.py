@@ -242,7 +242,10 @@ class DerivClient:
                                     or self.tick_handlers.get(clean)
                                 )
                                 if handler:
-                                    handler(candle_epoch + 59, close, time.monotonic())
+                                    # Advance to the exact next candle boundary
+                                    # so CandleManager closes the candle just
+                                    # fetched and exposes it as fresh history.
+                                    handler(candle_epoch + 60, close, time.monotonic())
                 except Exception as exc:
                     logger.debug("History fallback failed for %s: %s", symbol, exc)
                 finally:

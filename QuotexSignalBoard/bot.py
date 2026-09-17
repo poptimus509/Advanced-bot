@@ -43,6 +43,7 @@ init_db()
 # ============================================================
 
 latest_evaluations = {}
+pending_candidates = {}
 
 evaluation_lock = threading.Lock()
 state_lock = threading.RLock()
@@ -526,7 +527,7 @@ def dispatch_best_signal(candidate, target_epoch):
 # ALL-PAIR EVALUATION AND RANKING
 # ============================================================
 
-def evaluate_and_dispatch_all(target_epoch):
+def evaluate_and_dispatch_all(target_epoch, dispatch=True):
     if not evaluation_lock.acquire(blocking=False):
         return
 
@@ -624,7 +625,14 @@ def evaluate_and_dispatch_all(target_epoch):
             cfg.SIGNALS_ENABLED,
         )
 
-        if candidates and cfg.SIGNALS_ENABLED:
+        if candidates and cfg.SIGNALS_ENABLED and not dispatch:
+            with state_lock:
+                pending_candidates[target_epoch] = candidates
+                for old_epoch in list(pending_candidates):
+                    if old_epoch < target_epoch - 120:
+                        del pending_candidates[old_epoch]
+
+        if candidates and cfg.SIGNALS_ENABLED and dispatch:
             # Try candidates in score order. A duplicate/old ledger entry for
             # the top pair must not block the next valid pair.
             for candidate in candidates:
@@ -643,6 +651,25 @@ def evaluate_and_dispatch_all(target_epoch):
 
     finally:
         evaluation_lock.release()
+
+
+def dispatch_pending_candidates(target_epoch):
+    with state_lock:
+        candidates = pending_candidates.pop(target_epoch, [])
+
+    if not candidates or not cfg.SIGNALS_ENABLED:
+        return
+
+    for candidate in candidates:
+        status = dispatch_best_signal(candidate, target_epoch)
+        with state_lock:
+            report = latest_evaluations.get(candidate["display_name"])
+            if report is not None:
+                report["delivery"] = status
+        if status == "SENT":
+            break
+        if status != "DUPLICATE":
+            break
 
 
 # ============================================================
@@ -722,8 +749,8 @@ def run_scan_worker():
     ready.wait()
     logger.info("ScanWorker ready; entering 1M scan loop.")
     active_minute = None
-    finished_minute = None
-    last_attempt = 0.0
+    prepared_minute = None
+    dispatched_minute = None
 
     while True:
         try:
@@ -736,39 +763,24 @@ def run_scan_worker():
 
             if minute != active_minute:
                 active_minute = minute
-                last_attempt = 0.0
+                prepared_minute = None
+                dispatched_minute = None
 
-            if minute == finished_minute:
-                time.sleep(0.5)
-                continue
+            # Prepare the next candle's signal before its candle opens.
+            # Evaluation may take 20-30 seconds across all pairs.
+            if second >= 20.0 and prepared_minute != minute:
+                target_epoch = minute + 60
+                prepared_minute = minute
+                logger.info("Pre-scan started: target_minute=%s", target_epoch)
+                evaluate_and_dispatch_all(target_epoch, dispatch=False)
 
-            # Signals are valid during the first ten seconds of the new
-            # server-defined 1M candle. This gives the worker extra time
-            # after a small network/Render delay while still preventing late
-            # signals near the end of the candle.
-            if second >= 10.0:
-                finished_minute = minute
-                time.sleep(0.5)
-                continue
+            # Dispatch only at the beginning of the target candle.
+            if second <= 7.0 and dispatched_minute != minute:
+                dispatched_minute = minute
+                logger.info("Dispatch window: candle=%s second=%.2f", minute, second)
+                dispatch_pending_candidates(minute)
 
-            if second < 0.5:
-                time.sleep(0.1)
-                continue
-
-            monotonic_now = time.monotonic()
-            if monotonic_now - last_attempt < 2.0:
-                time.sleep(0.3)
-                continue
-
-            last_attempt = monotonic_now
-            logger.info("Scan cycle started: minute=%s second=%.2f", minute, second)
-            evaluate_and_dispatch_all(minute)
-            # The dispatch ledger still prevents duplicate Telegram sends.
-            # Do not query SQLite here: a database lock must never stop the
-            # real-time scan worker.
-            finished_minute = minute
-
-            time.sleep(0.5)
+            time.sleep(0.2)
 
         except Exception:
             logger.exception("Scan worker failed.")

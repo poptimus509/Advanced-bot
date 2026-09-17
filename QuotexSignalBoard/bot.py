@@ -147,6 +147,21 @@ def minute_has_dispatch_attempt(target_epoch):
 def reserve_dispatch(symbol, setup_id, target_epoch):
     conn = get_db_connection()
     try:
+        # Do not let one pair dominate the Telegram feed. After a successful
+        # signal, give other pairs a chance for the next five candles.
+        cooldown_before = int(target_epoch) - 300
+        recent = conn.execute(
+            """
+            SELECT 1 FROM dispatch_ledger_v3
+            WHERE symbol = ? AND status = 'SENT'
+              AND target_epoch < ? AND target_epoch >= ?
+            LIMIT 1
+            """,
+            (symbol, target_epoch, cooldown_before),
+        ).fetchone()
+        if recent:
+            return False
+
         conn.execute(
             """
             INSERT INTO dispatch_ledger_v3 (
@@ -180,16 +195,16 @@ def reserve_dispatch(symbol, setup_id, target_epoch):
         conn.close()
 
 
-def set_dispatch_status(target_epoch, status):
+def set_dispatch_status(target_epoch, symbol, status):
     conn = get_db_connection()
     try:
         conn.execute(
             """
             UPDATE dispatch_ledger_v3
             SET status = ?
-            WHERE target_epoch = ?
+            WHERE target_epoch = ? AND symbol = ?
             """,
-            (status, target_epoch),
+            (status, target_epoch, symbol),
         )
         conn.commit()
     finally:
@@ -493,7 +508,7 @@ def dispatch_best_signal(candidate, target_epoch):
         return "DUPLICATE"
 
     status = send_telegram_alert(candidate, target_epoch)
-    set_dispatch_status(target_epoch, status)
+    set_dispatch_status(target_epoch, candidate["symbol"], status)
 
     if status == "SENT":
         try:
@@ -564,6 +579,17 @@ def evaluate_and_dispatch_all(target_epoch, dispatch=True):
 
                 if df.empty or len(df) < 15:
                     report["score_reason"] = "LATEST_CLOSED_CANDLE_MISSING"
+                    reports[display] = report
+                    continue
+
+                # A signal for target candle T must be based on the candle
+                # immediately before it. If the feed is frozen, the same old
+                # candle must never be dispatched again every minute.
+                latest_candle_epoch = int(df.iloc[-1]["time"])
+                expected_closed_epoch = int(target_epoch) - 60
+                if latest_candle_epoch < expected_closed_epoch:
+                    report["score_reason"] = "STALE_ANALYSIS_CANDLE"
+                    report["analysis_candle_epoch"] = latest_candle_epoch
                     reports[display] = report
                     continue
 
@@ -772,14 +798,14 @@ def run_scan_worker():
 
             # Prepare the next candle's signal before its candle opens.
             # Evaluation may take 20-30 seconds across all pairs.
-            if second >= 20.0 and prepared_minute != minute:
+            if second >= 5.0 and prepared_minute != minute:
                 target_epoch = minute + 60
                 prepared_minute = minute
                 logger.info("Pre-scan started: target_minute=%s", target_epoch)
                 evaluate_and_dispatch_all(target_epoch, dispatch=False)
 
             # Dispatch only at the beginning of the target candle.
-            if second <= 7.0 and dispatched_minute != minute:
+            if second <= 10.0 and dispatched_minute != minute:
                 logger.info("Dispatch window: candle=%s second=%.2f", minute, second)
                 if dispatch_pending_candidates(minute):
                     dispatched_minute = minute

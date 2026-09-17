@@ -200,13 +200,16 @@ class DerivClient:
         logger.info(f"DerivClient: Subscribing to live ticks for {len(pairs_to_sub)} pairs.")
         for symbol in pairs_to_sub:
             clean = symbol.replace("frx", "").replace("/", "").upper()
-            for target_sym in [f"frx{clean}", clean]:
-                req = {"ticks": target_sym, "subscribe": 1}
-                try:
-                    ws.send(json.dumps(req))
-                except Exception:
-                    pass
-                time.sleep(0.04)
+            # Deriv Forex instruments must use the frx-prefixed symbol.
+            # Sending both frxSYMBOL and bare SYMBOL creates invalid/duplicate
+            # subscriptions and can leave the stream silent after reconnect.
+            target_sym = f"frx{clean}"
+            req = {"ticks": target_sym, "subscribe": 1}
+            try:
+                ws.send(json.dumps(req))
+            except Exception as exc:
+                logger.warning("Tick subscription failed for %s: %s", target_sym, exc)
+            time.sleep(0.08)
 
     def on_message(self, ws, message):
         try:

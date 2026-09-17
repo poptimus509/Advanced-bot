@@ -9,7 +9,11 @@ PUSHER_ENABLED = True
 
 # Deriv API Configuration (Required by deriv_client.py)
 APP_ID = 1089
-API_TOKEN = os.environ.get("API_TOKEN", "").strip()
+API_TOKEN = (
+    os.environ.get("API_TOKEN", "").strip()
+    or os.environ.get("DERIV_API_TOKEN", "").strip()
+    or os.environ.get("DERIV_TOKEN", "").strip()
+)
 
 DERIV_APP_ID = 1089
 DERIV_WS_URL = (

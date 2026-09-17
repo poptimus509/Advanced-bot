@@ -729,22 +729,18 @@ def run_scan_worker():
                 time.sleep(0.1)
                 continue
 
-            if minute_has_dispatch_attempt(minute):
-                finished_minute = minute
-                time.sleep(0.5)
-                continue
-
             monotonic_now = time.monotonic()
             if monotonic_now - last_attempt < 2.0:
                 time.sleep(0.3)
                 continue
 
             last_attempt = monotonic_now
+            logger.info("Scan cycle started: minute=%s second=%.2f", minute, second)
             evaluate_and_dispatch_all(minute)
-
-            attempted = minute_has_dispatch_attempt(minute)
-            if attempted:
-                finished_minute = minute
+            # The dispatch ledger still prevents duplicate Telegram sends.
+            # Do not query SQLite here: a database lock must never stop the
+            # real-time scan worker.
+            finished_minute = minute
 
             time.sleep(0.5)
 

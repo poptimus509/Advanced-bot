@@ -695,9 +695,7 @@ def run_scan_worker():
                 time.sleep(0.5)
                 continue
 
-            # Final entry signal is allowed only during the first ~2 seconds
-            # of the new server-defined 1M candle.
-            if second > 2.2:
+            if second > 4:
                 finished_minute = minute
                 time.sleep(0.5)
                 continue
@@ -741,19 +739,9 @@ def run_engine():
         while not deriv_client.is_connected and time.time() - wait_start < 10:
             time.sleep(0.5)
 
-        if not deriv_client.is_connected:
-            logger.error("Deriv connection timeout; engine will continue in degraded mode.")
-
-        # Do not block the signal worker on the initial 16-pair history fetch.
-        # The scan worker can start immediately and history will be seeded in
-        # the background as soon as the Deriv connection is available.
+        resync_historical_candles()
         ready.set()
         logger.info("Data engine initialized and history seeded. Signals are now active.")
-
-        try:
-            resync_historical_candles()
-        except Exception:
-            logger.exception("Initial history seed failed; retrying via history worker.")
     except Exception:
         logger.exception("Data engine failed to start.")
 
@@ -946,17 +934,7 @@ def api_performance():
 
 @app.route("/api/pairs")
 def api_pairs():
-    rows = []
-    for symbol, display in cfg.FOREX_PAIRS.items():
-        quote = live_quote(symbol)
-        rows.append({
-            "symbol": symbol,
-            "display": display,
-            "price": quote["price"] if quote else None,
-            "epoch": quote["epoch"] if quote else None,
-            "active": quote is not None,
-        })
-    return jsonify(rows)
+    return jsonify(cfg.FOREX_PAIRS)
 
 
 if __name__ == "__main__":

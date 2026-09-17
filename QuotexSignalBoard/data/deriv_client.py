@@ -45,6 +45,11 @@ class DerivClient:
 
     def fetch_historical_candles_batch_sync(self, jobs: List[dict]) -> Dict[str, List[dict]]:
         results = {}
+        # A watchdog reconnect can happen between any two history requests.
+        # Never send a request through the old/closed WebSocket.
+        deadline = time.time() + 12.0
+        while time.time() < deadline and (not self.connected or not self.ws):
+            time.sleep(0.25)
         if not self.ws or not self.connected:
             return {job.get("key", ""): [] for job in jobs}
 
@@ -72,17 +77,21 @@ class DerivClient:
             }
 
             try:
-                self.ws.send(json.dumps(req))
+                ws = self.ws
+                if not self.connected or ws is None:
+                    results[key] = []
+                    continue
+                ws.send(json.dumps(req))
                 if event.wait(timeout=3.0):
                     candles = self._request_results.pop(req_id, [])
                     if candles:
                         results[key] = candles
                     else:
-                        results[key] = self._fetch_single_history(clean_symbol, count, granularity)
+                        results[key] = []
                 else:
-                    results[key] = self._fetch_single_history(clean_symbol, count, granularity)
+                    results[key] = []
             except Exception as e:
-                logger.error(f"Error fetching history for {symbol}: {e}")
+                logger.warning("History request skipped for %s; WebSocket changed state: %s", symbol, e)
                 results[key] = []
             finally:
                 self._pending_requests.pop(req_id, None)
@@ -104,7 +113,10 @@ class DerivClient:
             "req_id": req_id
         }
         try:
-            self.ws.send(json.dumps(req))
+            ws = self.ws
+            if not self.connected or ws is None:
+                return []
+            ws.send(json.dumps(req))
             if event.wait(timeout=3.0):
                 return self._request_results.pop(req_id, [])
         except Exception:

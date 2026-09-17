@@ -705,7 +705,10 @@ def run_scan_worker():
 
     while True:
         try:
-            now = deriv_client.get_server_time()
+            # Use local Unix time for scheduling. Deriv's last tick epoch can
+            # remain stale when a subscription pauses, which would freeze the
+            # minute boundary and prevent all scans.
+            now = time.time()
             minute = int(now // 60) * 60
             second = now - minute
 

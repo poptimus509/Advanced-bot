@@ -767,16 +767,16 @@ def run_engine():
         if not deriv_client.is_connected:
             logger.error("Deriv connection timeout; engine will continue in degraded mode.")
 
-        # Do not block the signal worker on the initial 16-pair history fetch.
-        # The scan worker can start immediately and history will be seeded in
-        # the background as soon as the Deriv connection is available.
-        ready.set()
-        logger.info("Data engine initialized and history seeded. Signals are now active.")
-
         try:
             resync_historical_candles()
         except Exception:
             logger.exception("Initial history seed failed; retrying via history worker.")
+
+        # Do not release ScanWorker before the initial candle history is
+        # seeded. Otherwise it can evaluate an empty dataframe during the
+        # first candle window and permanently skip that minute.
+        ready.set()
+        logger.info("Data engine initialized and history seeded. Signals are now active.")
     except Exception:
         logger.exception("Data engine failed to start.")
 

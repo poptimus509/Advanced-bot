@@ -399,12 +399,30 @@ def send_telegram_alert(candidate, target_epoch):
             json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": message},
             timeout=(2, 3),
         )
-        body = response.json()
+        try:
+            body = response.json()
+        except ValueError:
+            body = {"raw": response.text[:500]}
+
+        logger.info(
+            "Telegram response: status=%s body=%s",
+            response.status_code,
+            body,
+        )
+
         if response.status_code == 200 and body.get("ok") is True:
             logger.info("Telegram SENT for %s %s", candidate["display_name"], candidate["direction"])
             return "SENT"
+
+        logger.error(
+            "Telegram REJECTED for %s: status=%s description=%s",
+            candidate["display_name"],
+            response.status_code,
+            body.get("description", body),
+        )
         return "REJECTED"
-    except Exception:
+    except Exception as exc:
+        logger.exception("Telegram request failed: %s", exc)
         return "UNKNOWN"
 
 

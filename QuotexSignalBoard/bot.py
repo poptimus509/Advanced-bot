@@ -586,8 +586,11 @@ def evaluate_and_dispatch_all(target_epoch, dispatch=True):
                 # immediately before it. If the feed is frozen, the same old
                 # candle must never be dispatched again every minute.
                 latest_candle_epoch = int(df.iloc[-1]["time"])
+                # Candle `time` is its opening epoch; its closed epoch is
+                # opening epoch + 60 seconds.
+                latest_closed_epoch = latest_candle_epoch + 60
                 expected_closed_epoch = int(target_epoch) - 60
-                if latest_candle_epoch < expected_closed_epoch:
+                if latest_closed_epoch < expected_closed_epoch:
                     report["score_reason"] = "STALE_ANALYSIS_CANDLE"
                     report["analysis_candle_epoch"] = latest_candle_epoch
                     reports[display] = report

@@ -717,14 +717,15 @@ def run_scan_worker():
                 time.sleep(0.5)
                 continue
 
-            # Final entry signal is allowed only during the first ~2 seconds
-            # of the new server-defined 1M candle.
-            if second > 2.2:
+            # Evaluate once during the first 10 seconds of every new
+            # server-defined 1M candle. Render/Deriv network latency can make
+            # a 0.8-2.2 second window unreliable after a reconnect/restart.
+            if second >= 10.0:
                 finished_minute = minute
                 time.sleep(0.5)
                 continue
 
-            if second < 0.8:
+            if second < 0.5:
                 time.sleep(0.1)
                 continue
 

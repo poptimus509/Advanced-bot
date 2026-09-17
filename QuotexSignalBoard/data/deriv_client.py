@@ -185,12 +185,15 @@ class DerivClient:
                 continue
 
             silence = time.time() - self.last_tick_wall_time
-            if silence > 20:
+            # A silent tick subscription does not necessarily mean the
+            # WebSocket itself is unusable: ticks_history fallback requests
+            # may still work. Do not kill the socket after 20 seconds, or the
+            # fallback worker is interrupted before it can refresh candles.
+            if silence > 60:
                 logger.warning(
-                    "No Deriv tick received for %.1f seconds; reconnecting WebSocket.",
+                    "No Deriv tick received for %.1f seconds; refreshing WebSocket.",
                     silence,
                 )
-                self.connected = False
                 try:
                     if self.ws:
                         self.ws.close()

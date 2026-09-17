@@ -588,8 +588,8 @@ def evaluate_and_dispatch_all(target_epoch):
                 feed_is_fresh = (
                     isinstance(tick_age, (int, float))
                     and isinstance(receipt_age, (int, float))
-                    and tick_age <= 10
-                    and receipt_age <= 10
+                    and tick_age <= 15
+                    and receipt_age <= 15
                 )
 
                 if direction in ("CALL", "PUT") and not feed_is_fresh:
@@ -749,9 +749,11 @@ def run_scan_worker():
                 time.sleep(0.5)
                 continue
 
-            # Signals are valid only during the first five seconds of the
-            # new server-defined 1M candle. Never send a late signal.
-            if second >= 5.0:
+            # Signals are valid during the first ten seconds of the new
+            # server-defined 1M candle. This gives the worker extra time
+            # after a small network/Render delay while still preventing late
+            # signals near the end of the candle.
+            if second >= 10.0:
                 finished_minute = minute
                 time.sleep(0.5)
                 continue

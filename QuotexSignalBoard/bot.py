@@ -161,6 +161,19 @@ def reserve_dispatch(symbol, setup_id, target_epoch):
         conn.commit()
         return True
     except sqlite3.IntegrityError:
+        # A previous attempt for this candle may have failed or been
+        # interrupted. Allow retry unless Telegram already confirmed SENT.
+        row = conn.execute(
+            "SELECT status FROM dispatch_ledger_v2 WHERE target_epoch = ?",
+            (target_epoch,),
+        ).fetchone()
+        if row and row[0] != "SENT":
+            conn.execute(
+                "UPDATE dispatch_ledger_v2 SET symbol = ?, setup_id = ?, status = 'ATTEMPTING' WHERE target_epoch = ?",
+                (symbol, setup_id, target_epoch),
+            )
+            conn.commit()
+            return True
         return False
     finally:
         conn.close()
@@ -569,6 +582,21 @@ def evaluate_and_dispatch_all(target_epoch):
                     "relative_activity": details.get("relative_activity", 1.0),
                     "analysis_candle_epoch": int(df.iloc[-1]["time"]),
                 })
+
+                tick_age = report.get("tick_age_seconds")
+                receipt_age = report.get("receipt_age_seconds")
+                feed_is_fresh = (
+                    isinstance(tick_age, (int, float))
+                    and isinstance(receipt_age, (int, float))
+                    and tick_age <= 10
+                    and receipt_age <= 10
+                )
+
+                if direction in ("CALL", "PUT") and not feed_is_fresh:
+                    report["direction"] = "NO_TRADE"
+                    report["score_reason"] = "STALE_TICK_FEED"
+                    reports[display] = report
+                    continue
 
                 if direction in ("CALL", "PUT"):
                     # A setup may legitimately appear again on a later

@@ -29,15 +29,14 @@ PUSHER_CLUSTER = os.environ.get("PUSHER_CLUSTER", "ap2")
 # How many closed 1M candles CandleManager keeps in memory per symbol.
 CANDLE_HISTORY_LIMIT = 1000
 
-# Minimum number of 1M candles required before a symbol is evaluated at
-# all (Reduced to 20 so it won't block startup scanning)
+# Minimum number of 1M candles required before a symbol is evaluated at all
 MIN_1M_HISTORY = 20
 
-# A tick/quote older than this is treated as dead
+# A tick/quote older than this is treated as dead, not "the current price"
 STALE_TICK_THRESHOLD_SEC = 25.0
 
-# Strategy scoring threshold
-SIGNAL_THRESHOLD_CALL_PUT = 8
+# Strategy scoring threshold (Reduced to 6 so valid currency pairs can trigger signals)
+SIGNAL_THRESHOLD_CALL_PUT = 6
 
 DB_PATH = os.environ.get("DB_PATH", "signal_board.db")
 TIMEZONE_NAME = "Asia/Dhaka"

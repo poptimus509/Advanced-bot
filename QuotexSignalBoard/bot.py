@@ -43,7 +43,6 @@ init_db()
 # ============================================================
 
 latest_evaluations = {}
-pending_candidates = {}
 
 evaluation_lock = threading.Lock()
 state_lock = threading.RLock()
@@ -95,12 +94,12 @@ def init_dispatch_ledger():
     try:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS dispatch_ledger_v3 (
-                target_epoch INTEGER NOT NULL,
+            CREATE TABLE IF NOT EXISTS dispatch_ledger_v2 (
+                target_epoch INTEGER PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 setup_id TEXT NOT NULL,
                 status TEXT NOT NULL,
-                PRIMARY KEY (target_epoch, symbol)
+                UNIQUE(symbol, setup_id)
             )
             """
         )
@@ -118,7 +117,7 @@ def used_setup(symbol, setup_id):
         row = conn.execute(
             """
             SELECT 1
-            FROM dispatch_ledger_v3
+            FROM dispatch_ledger_v2
             WHERE symbol = ? AND setup_id = ?
             """,
             (symbol, setup_id),
@@ -134,7 +133,7 @@ def minute_has_dispatch_attempt(target_epoch):
         row = conn.execute(
             """
             SELECT 1
-            FROM dispatch_ledger_v3
+            FROM dispatch_ledger_v2
             WHERE target_epoch = ?
             """,
             (target_epoch,),
@@ -147,24 +146,9 @@ def minute_has_dispatch_attempt(target_epoch):
 def reserve_dispatch(symbol, setup_id, target_epoch):
     conn = get_db_connection()
     try:
-        # Do not let one pair dominate the Telegram feed. After a successful
-        # signal, give other pairs a chance for the next five candles.
-        cooldown_before = int(target_epoch) - 300
-        recent = conn.execute(
-            """
-            SELECT 1 FROM dispatch_ledger_v3
-            WHERE symbol = ? AND status = 'SENT'
-              AND target_epoch < ? AND target_epoch >= ?
-            LIMIT 1
-            """,
-            (symbol, target_epoch, cooldown_before),
-        ).fetchone()
-        if recent:
-            return False
-
         conn.execute(
             """
-            INSERT INTO dispatch_ledger_v3 (
+            INSERT INTO dispatch_ledger_v2 (
                 target_epoch,
                 symbol,
                 setup_id,
@@ -177,34 +161,21 @@ def reserve_dispatch(symbol, setup_id, target_epoch):
         conn.commit()
         return True
     except sqlite3.IntegrityError:
-        # A previous attempt for this candle may have failed or been
-        # interrupted. Allow retry unless Telegram already confirmed SENT.
-        row = conn.execute(
-            "SELECT status FROM dispatch_ledger_v3 WHERE target_epoch = ? AND symbol = ?",
-            (target_epoch, symbol),
-        ).fetchone()
-        if row and row[0] != "SENT":
-            conn.execute(
-                "UPDATE dispatch_ledger_v3 SET setup_id = ?, status = 'ATTEMPTING' WHERE target_epoch = ? AND symbol = ?",
-                (setup_id, target_epoch, symbol),
-            )
-            conn.commit()
-            return True
         return False
     finally:
         conn.close()
 
 
-def set_dispatch_status(target_epoch, symbol, status):
+def set_dispatch_status(target_epoch, status):
     conn = get_db_connection()
     try:
         conn.execute(
             """
-            UPDATE dispatch_ledger_v3
+            UPDATE dispatch_ledger_v2
             SET status = ?
-            WHERE target_epoch = ? AND symbol = ?
+            WHERE target_epoch = ?
             """,
-            (status, target_epoch, symbol),
+            (status, target_epoch),
         )
         conn.commit()
     finally:
@@ -428,30 +399,12 @@ def send_telegram_alert(candidate, target_epoch):
             json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": message},
             timeout=(2, 3),
         )
-        try:
-            body = response.json()
-        except ValueError:
-            body = {"raw": response.text[:500]}
-
-        logger.info(
-            "Telegram response: status=%s body=%s",
-            response.status_code,
-            body,
-        )
-
+        body = response.json()
         if response.status_code == 200 and body.get("ok") is True:
             logger.info("Telegram SENT for %s %s", candidate["display_name"], candidate["direction"])
             return "SENT"
-
-        logger.error(
-            "Telegram REJECTED for %s: status=%s description=%s",
-            candidate["display_name"],
-            response.status_code,
-            body.get("description", body),
-        )
         return "REJECTED"
-    except Exception as exc:
-        logger.exception("Telegram request failed: %s", exc)
+    except Exception:
         return "UNKNOWN"
 
 
@@ -508,7 +461,7 @@ def dispatch_best_signal(candidate, target_epoch):
         return "DUPLICATE"
 
     status = send_telegram_alert(candidate, target_epoch)
-    set_dispatch_status(target_epoch, candidate["symbol"], status)
+    set_dispatch_status(target_epoch, status)
 
     if status == "SENT":
         try:
@@ -542,7 +495,7 @@ def dispatch_best_signal(candidate, target_epoch):
 # ALL-PAIR EVALUATION AND RANKING
 # ============================================================
 
-def evaluate_and_dispatch_all(target_epoch, dispatch=True):
+def evaluate_and_dispatch_all(target_epoch):
     if not evaluation_lock.acquire(blocking=False):
         return
 
@@ -582,20 +535,6 @@ def evaluate_and_dispatch_all(target_epoch, dispatch=True):
                     reports[display] = report
                     continue
 
-                # A signal for target candle T must be based on the candle
-                # immediately before it. If the feed is frozen, the same old
-                # candle must never be dispatched again every minute.
-                latest_candle_epoch = int(df.iloc[-1]["time"])
-                # Candle `time` is its opening epoch; its closed epoch is
-                # opening epoch + 60 seconds.
-                latest_closed_epoch = latest_candle_epoch + 60
-                expected_closed_epoch = int(target_epoch) - 60
-                if latest_closed_epoch < expected_closed_epoch:
-                    report["score_reason"] = "STALE_ANALYSIS_CANDLE"
-                    report["analysis_candle_epoch"] = latest_candle_epoch
-                    reports[display] = report
-                    continue
-
                 direction, score, quality, details = evaluate_strategy(df, df5, df15)
 
                 report.update({
@@ -614,19 +553,18 @@ def evaluate_and_dispatch_all(target_epoch, dispatch=True):
                 })
 
                 if direction in ("CALL", "PUT"):
-                    # A setup may legitimately appear again on a later
-                    # candle. Duplicate prevention is handled by
-                    # reserve_dispatch(target_epoch), so do not permanently
-                    # block this setup across all future candles.
-                    candidates.append({
-                        "symbol": symbol,
-                        "display_name": display,
-                        "direction": direction,
-                        "score": score,
-                        "quality": quality,
-                        "details": details,
-                        "analysis_close": float(df.iloc[-1]["close"]),
-                    })
+                    if used_setup(symbol, details.get("setup_id", "")):
+                        report["delivery"] = "SETUP_ALREADY_ATTEMPTED"
+                    else:
+                        candidates.append({
+                            "symbol": symbol,
+                            "display_name": display,
+                            "direction": direction,
+                            "score": score,
+                            "quality": quality,
+                            "details": details,
+                            "analysis_close": float(df.iloc[-1]["close"]),
+                        })
 
             except Exception as exc:
                 report["score_reason"] = f"DATA_ERROR:{type(exc).__name__}"
@@ -654,25 +592,10 @@ def evaluate_and_dispatch_all(target_epoch, dispatch=True):
             cfg.SIGNALS_ENABLED,
         )
 
-        if candidates and cfg.SIGNALS_ENABLED and not dispatch:
-            with state_lock:
-                pending_candidates[target_epoch] = candidates
-                for old_epoch in list(pending_candidates):
-                    if old_epoch < target_epoch - 120:
-                        del pending_candidates[old_epoch]
-
-        if candidates and cfg.SIGNALS_ENABLED and dispatch:
-            # Try candidates in score order. A duplicate/old ledger entry for
-            # the top pair must not block the next valid pair.
-            for candidate in candidates:
-                status = dispatch_best_signal(candidate, target_epoch)
-                reports[candidate["display_name"]]["delivery"] = status
-
-                if status == "SENT":
-                    break
-
-                if status != "DUPLICATE":
-                    break
+        if candidates and cfg.SIGNALS_ENABLED:
+            best_candidate = candidates[0]
+            status = dispatch_best_signal(best_candidate, target_epoch)
+            reports[best_candidate["display_name"]]["delivery"] = status
 
         with state_lock:
             latest_evaluations.clear()
@@ -680,29 +603,6 @@ def evaluate_and_dispatch_all(target_epoch, dispatch=True):
 
     finally:
         evaluation_lock.release()
-
-
-def dispatch_pending_candidates(target_epoch):
-    with state_lock:
-        candidates = list(pending_candidates.get(target_epoch, []))
-
-    if not candidates or not cfg.SIGNALS_ENABLED:
-        return False
-
-    for candidate in candidates:
-        status = dispatch_best_signal(candidate, target_epoch)
-        with state_lock:
-            report = latest_evaluations.get(candidate["display_name"])
-            if report is not None:
-                report["delivery"] = status
-        if status == "SENT":
-            with state_lock:
-                pending_candidates.pop(target_epoch, None)
-            return True
-        if status != "DUPLICATE":
-            return False
-
-    return False
 
 
 # ============================================================
@@ -753,9 +653,7 @@ def resync_historical_candles():
 
 
 def run_history_worker():
-    logger.info("HistoryWorker started; waiting for engine readiness.")
     ready.wait()
-    logger.info("HistoryWorker ready.")
     last_minute = None
 
     while True:
@@ -778,43 +676,52 @@ def run_history_worker():
 # ============================================================
 
 def run_scan_worker():
-    logger.info("ScanWorker started; waiting for engine readiness.")
     ready.wait()
-    logger.info("ScanWorker ready; entering 1M scan loop.")
     active_minute = None
-    prepared_minute = None
-    dispatched_minute = None
+    finished_minute = None
+    last_attempt = 0.0
 
     while True:
         try:
-            # Use local Unix time for scheduling. Deriv's last tick epoch can
-            # remain stale when a subscription pauses, which would freeze the
-            # minute boundary and prevent all scans.
-            now = time.time()
+            now = deriv_client.get_server_time()
             minute = int(now // 60) * 60
             second = now - minute
 
             if minute != active_minute:
                 active_minute = minute
-                prepared_minute = None
-                dispatched_minute = None
+                last_attempt = 0.0
 
-            # Prepare the next candle's signal before its candle opens.
-            # Evaluation may take 20-30 seconds across all pairs.
-            if second >= 5.0 and prepared_minute != minute:
-                target_epoch = minute + 60
-                prepared_minute = minute
-                logger.info("Pre-scan started: target_minute=%s", target_epoch)
-                evaluate_and_dispatch_all(target_epoch, dispatch=False)
+            if minute == finished_minute:
+                time.sleep(0.5)
+                continue
 
-            # Dispatch only at the beginning of the target candle.
-            if second <= 10.0 and dispatched_minute != minute:
-                logger.info("Dispatch window: candle=%s second=%.2f", minute, second)
-                sent = dispatch_pending_candidates(minute)
-                if sent or not pending_candidates.get(minute):
-                    dispatched_minute = minute
+            if second > 4:
+                finished_minute = minute
+                time.sleep(0.5)
+                continue
 
-            time.sleep(0.2)
+            if second < 0.8:
+                time.sleep(0.1)
+                continue
+
+            if minute_has_dispatch_attempt(minute):
+                finished_minute = minute
+                time.sleep(0.5)
+                continue
+
+            monotonic_now = time.monotonic()
+            if monotonic_now - last_attempt < 2.0:
+                time.sleep(0.3)
+                continue
+
+            last_attempt = monotonic_now
+            evaluate_and_dispatch_all(minute)
+
+            attempted = minute_has_dispatch_attempt(minute)
+            if attempted:
+                finished_minute = minute
+
+            time.sleep(0.5)
 
         except Exception:
             logger.exception("Scan worker failed.")
@@ -832,17 +739,7 @@ def run_engine():
         while not deriv_client.is_connected and time.time() - wait_start < 10:
             time.sleep(0.5)
 
-        if not deriv_client.is_connected:
-            logger.error("Deriv connection timeout; engine will continue in degraded mode.")
-
-        try:
-            resync_historical_candles()
-        except Exception:
-            logger.exception("Initial history seed failed; retrying via history worker.")
-
-        # Do not release ScanWorker before the initial candle history is
-        # seeded. Otherwise it can evaluate an empty dataframe during the
-        # first candle window and permanently skip that minute.
+        resync_historical_candles()
         ready.set()
         logger.info("Data engine initialized and history seeded. Signals are now active.")
     except Exception:
@@ -854,7 +751,6 @@ def run_engine():
 # ============================================================
 
 def run_outcome_worker():
-    logger.info("OutcomeWorker started.")
     while True:
         time.sleep(10)
         conn = None
@@ -930,7 +826,6 @@ def start_background_threads_once():
         )
 
         for name, function in workers:
-            logger.info("Starting background worker: %s", name)
             threading.Thread(target=function, daemon=True, name=name).start()
 
 
@@ -1039,17 +934,7 @@ def api_performance():
 
 @app.route("/api/pairs")
 def api_pairs():
-    rows = []
-    for symbol, display in cfg.FOREX_PAIRS.items():
-        quote = live_quote(symbol)
-        rows.append({
-            "symbol": symbol,
-            "display": display,
-            "price": quote["price"] if quote else None,
-            "epoch": quote["epoch"] if quote else None,
-            "active": quote is not None,
-        })
-    return jsonify(rows)
+    return jsonify(cfg.FOREX_PAIRS)
 
 
 if __name__ == "__main__":

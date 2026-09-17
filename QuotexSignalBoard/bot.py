@@ -702,7 +702,6 @@ def run_scan_worker():
     active_minute = None
     finished_minute = None
     last_attempt = 0.0
-    startup_scan_done = False
 
     while True:
         try:
@@ -714,29 +713,13 @@ def run_scan_worker():
                 active_minute = minute
                 last_attempt = 0.0
 
-            # If Render starts/restarts after the first 10 seconds of a
-            # candle, do one immediate scan instead of skipping the entire
-            # minute. This also proves the worker is actually evaluating.
-            if not startup_scan_done:
-                startup_scan_done = True
-                logger.info(
-                    "Forced startup scan: minute=%s second=%.2f",
-                    minute,
-                    second,
-                )
-                evaluate_and_dispatch_all(minute)
-                finished_minute = minute
-                time.sleep(0.5)
-                continue
-
             if minute == finished_minute:
                 time.sleep(0.5)
                 continue
 
-            # Evaluate once during the first 10 seconds of every new
-            # server-defined 1M candle. Render/Deriv network latency can make
-            # a 0.8-2.2 second window unreliable after a reconnect/restart.
-            if second >= 10.0:
+            # Signals are valid only during the first five seconds of the
+            # new server-defined 1M candle. Never send a late signal.
+            if second >= 5.0:
                 finished_minute = minute
                 time.sleep(0.5)
                 continue

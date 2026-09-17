@@ -571,18 +571,19 @@ def evaluate_and_dispatch_all(target_epoch):
                 })
 
                 if direction in ("CALL", "PUT"):
-                    if used_setup(symbol, details.get("setup_id", "")):
-                        report["delivery"] = "SETUP_ALREADY_ATTEMPTED"
-                    else:
-                        candidates.append({
-                            "symbol": symbol,
-                            "display_name": display,
-                            "direction": direction,
-                            "score": score,
-                            "quality": quality,
-                            "details": details,
-                            "analysis_close": float(df.iloc[-1]["close"]),
-                        })
+                    # A setup may legitimately appear again on a later
+                    # candle. Duplicate prevention is handled by
+                    # reserve_dispatch(target_epoch), so do not permanently
+                    # block this setup across all future candles.
+                    candidates.append({
+                        "symbol": symbol,
+                        "display_name": display,
+                        "direction": direction,
+                        "score": score,
+                        "quality": quality,
+                        "details": details,
+                        "analysis_close": float(df.iloc[-1]["close"]),
+                    })
 
             except Exception as exc:
                 report["score_reason"] = f"DATA_ERROR:{type(exc).__name__}"

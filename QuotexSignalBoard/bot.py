@@ -625,9 +625,17 @@ def evaluate_and_dispatch_all(target_epoch):
         )
 
         if candidates and cfg.SIGNALS_ENABLED:
-            best_candidate = candidates[0]
-            status = dispatch_best_signal(best_candidate, target_epoch)
-            reports[best_candidate["display_name"]]["delivery"] = status
+            # Try candidates in score order. A duplicate/old ledger entry for
+            # the top pair must not block the next valid pair.
+            for candidate in candidates:
+                status = dispatch_best_signal(candidate, target_epoch)
+                reports[candidate["display_name"]]["delivery"] = status
+
+                if status == "SENT":
+                    break
+
+                if status != "DUPLICATE":
+                    break
 
         with state_lock:
             latest_evaluations.clear()

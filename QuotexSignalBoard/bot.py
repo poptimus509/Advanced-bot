@@ -583,21 +583,6 @@ def evaluate_and_dispatch_all(target_epoch):
                     "analysis_candle_epoch": int(df.iloc[-1]["time"]),
                 })
 
-                tick_age = report.get("tick_age_seconds")
-                receipt_age = report.get("receipt_age_seconds")
-                feed_is_fresh = (
-                    isinstance(tick_age, (int, float))
-                    and isinstance(receipt_age, (int, float))
-                    and tick_age <= 15
-                    and receipt_age <= 15
-                )
-
-                if direction in ("CALL", "PUT") and not feed_is_fresh:
-                    report["direction"] = "NO_TRADE"
-                    report["score_reason"] = "STALE_TICK_FEED"
-                    reports[display] = report
-                    continue
-
                 if direction in ("CALL", "PUT"):
                     # A setup may legitimately appear again on a later
                     # candle. Duplicate prevention is handled by

@@ -1,1607 +1,600 @@
-import datetime
 import logging
 import math
 import os
-import sqlite3
 import threading
 import time
 
-import pusher
-import pytz
-import requests
 import pandas as pd
-from flask import Flask, jsonify, render_template
+
+from flask import (
+    Flask,
+    jsonify,
+    render_template,
+)
 
 import config as cfg
 
 from core.events import EventDispatcher
 from data.candle_manager import CandleManager
 from data.deriv_client import DerivClient
-from database import get_db_connection, init_db
-from indicators import calculate_adx
-from monitor import get_today_performance
-from strategy import evaluate_strategy, prepare_history
+from strategy import (
+    evaluate_strategy,
+    prepare_history,
+)
 
 
 # ============================================================
-# LOGGING AND APPLICATION (EXPOSED GLOBALLY FOR GUNICORN)
+# LOGGING
 # ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format=(
+        "%(asctime)s "
+        "[%(levelname)s] "
+        "%(name)s: "
+        "%(message)s"
+    ),
 )
 
-logger = logging.getLogger("QuotexSignalBoard")
+logger = logging.getLogger(
+    "PaperResearchBot"
+)
 
-# This must be defined globally at module level for 'bot:app'
+
+# ============================================================
+# FLASK
+# ============================================================
+
 app = Flask(__name__)
-init_db()
 
 
 # ============================================================
 # SHARED STATE
 # ============================================================
 
-latest_evaluations = {}
+event_dispatcher = (
+    EventDispatcher()
+)
 
-evaluation_lock = threading.Lock()
-state_lock = threading.RLock()
-history_lock = threading.Lock()
-
-event_dispatcher = EventDispatcher()
-deriv_client = DerivClient()
+market_client = (
+    DerivClient()
+)
 
 candle_managers = {}
+
 live_state = {}
-tick_windows = {}
-history_diagnostic_seen = set()
+
+latest_evaluations = {}
+
+paper_signals = []
+
+state_lock = threading.RLock()
 
 ready = threading.Event()
 
 _threads_started = False
+
 _threads_lock = threading.Lock()
 
 
 # ============================================================
-# PUSHER
+# SYMBOL HELPERS
 # ============================================================
 
-pusher_client = None
+def normalize_symbol(symbol):
+    return (
+        str(symbol)
+        .replace("frx", "")
+        .replace("/", "")
+        .upper()
+    )
 
-if (
-    getattr(cfg, "PUSHER_ENABLED", False)
-    and getattr(cfg, "PUSHER_APP_ID", None)
-    and getattr(cfg, "PUSHER_KEY", None)
-    and getattr(cfg, "PUSHER_SECRET", None)
+
+# ============================================================
+# TICK HANDLER
+# ============================================================
+
+def create_tick_handler(
+    symbol,
+    manager,
 ):
-    try:
-        pusher_client = pusher.Pusher(
-            app_id=cfg.PUSHER_APP_ID,
-            key=cfg.PUSHER_KEY,
-            secret=cfg.PUSHER_SECRET,
-            cluster=getattr(cfg, "PUSHER_CLUSTER", "mt1"),
-            ssl=True,
-        )
-    except Exception:
-        logger.error("Pusher initialization failed.")
 
+    clean = normalize_symbol(
+        symbol
+    )
 
-# ============================================================
-# PERSISTENT DELIVERY DEDUPLICATION
-# ============================================================
-
-def init_dispatch_ledger():
-    conn = get_db_connection()
-    try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dispatch_ledger_v2 (
-                target_epoch INTEGER PRIMARY KEY,
-                symbol TEXT NOT NULL,
-                setup_id TEXT NOT NULL,
-                status TEXT NOT NULL,
-                UNIQUE(symbol, setup_id)
-            )
-            """
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-init_dispatch_ledger()
-
-
-def used_setup(symbol, setup_id):
-    conn = get_db_connection()
-    try:
-        row = conn.execute(
-            """
-            SELECT 1
-            FROM dispatch_ledger_v2
-            WHERE symbol = ? AND setup_id = ?
-            """,
-            (symbol, setup_id),
-        ).fetchone()
-        return row is not None
-    finally:
-        conn.close()
-
-
-def minute_has_dispatch_attempt(target_epoch):
-    conn = get_db_connection()
-    try:
-        row = conn.execute(
-            """
-            SELECT 1
-            FROM dispatch_ledger_v2
-            WHERE target_epoch = ?
-            """,
-            (target_epoch,),
-        ).fetchone()
-        return row is not None
-    finally:
-        conn.close()
-
-
-def reserve_dispatch(symbol, setup_id, target_epoch):
-    conn = get_db_connection()
-    try:
-        conn.execute(
-            """
-            INSERT INTO dispatch_ledger_v2 (
-                target_epoch,
-                symbol,
-                setup_id,
-                status
-            )
-            VALUES (?, ?, ?, 'ATTEMPTING')
-            """,
-            (target_epoch, symbol, setup_id),
-        )
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-    finally:
-        conn.close()
-
-
-def set_dispatch_status(target_epoch, status):
-    conn = get_db_connection()
-    try:
-        conn.execute(
-            """
-            UPDATE dispatch_ledger_v2
-            SET status = ?
-            WHERE target_epoch = ?
-            """,
-            (status, target_epoch),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-# ============================================================
-# SYMBOL HELPER & NORMALIZER
-# ============================================================
-
-def get_symbol_variants(symbol: str):
-    clean = symbol.replace("frx", "").replace("/", "").upper()
-
-    variants = {
-        symbol,
-        clean,
-        f"frx{clean}",
-        f"{clean[:3]}/{clean[3:]}" if len(clean) == 6 else clean,
-    }
-
-    return list(variants)
-
-
-# ============================================================
-# LIVE TICK COLLECTION
-# ============================================================
-
-def make_tick_handler(symbol, manager):
-
-    def handle(epoch, price, receipt_time):
-
+    def handle(
+        epoch,
+        price,
+        receipt_time,
+    ):
         try:
             epoch = int(epoch)
+
             price = float(price)
 
-            if not math.isfinite(price) or price <= 0:
-                return []
-
-            monotonic_now = time.monotonic()
-
-            boundary = (epoch // 60) * 60
-
-            variants = get_symbol_variants(symbol)
+            if (
+                not math.isfinite(
+                    price
+                )
+                or price <= 0
+            ):
+                return
 
             with state_lock:
+                live_state[
+                    clean
+                ] = {
+                    "epoch":
+                        epoch,
+                    "price":
+                        price,
+                    "receipt":
+                        float(
+                            receipt_time
+                        ),
+                }
 
-                for target_key in variants:
-
-                    previous = live_state.get(target_key)
-
-                    if previous and epoch < previous["epoch"]:
-                        continue
-
-                    windows = tick_windows.setdefault(
-                        target_key,
-                        {},
-                    )
-
-                    # Mark older windows complete only when we actually saw
-                    # the next minute arrive.
-                    #
-                    # A window that started midway through a minute remains
-                    # partial instead of being mislabeled as fully observed.
-                    for old_boundary, old_window in list(
-                        windows.items()
-                    ):
-
-                        if (
-                            old_boundary < boundary
-                            and not old_window.get(
-                                "complete",
-                                False,
-                            )
-                        ):
-
-                            old_window["complete"] = bool(
-                                old_window.get(
-                                    "first",
-                                    old_boundary + 999,
-                                )
-                                <= old_boundary + 2
-                            )
-
-                    window = windows.get(boundary)
-
-                    if window is None:
-
-                        window = {
-                            "count": 1,
-                            "first": epoch,
-                            "last": epoch,
-                            "last_receipt": monotonic_now,
-                            "complete": False,
-                        }
-
-                        windows[boundary] = window
-
-                    else:
-
-                        window["count"] += 1
-                        window["last"] = epoch
-                        window["last_receipt"] = monotonic_now
-
-                    live_state[target_key] = {
-                        "epoch": epoch,
-                        "price": price,
-                        "receipt": monotonic_now,
-                    }
-
-                    oldest_allowed = (
-                        boundary
-                        - getattr(
-                            cfg,
-                            "CANDLE_HISTORY_LIMIT",
-                            200,
-                        )
-                        * 60
-                    )
-
-                    for old_epoch in list(windows):
-
-                        if old_epoch < oldest_allowed:
-                            del windows[old_epoch]
-
-            return manager.process_tick(
+            manager.process_tick(
                 epoch,
                 price,
                 receipt_time,
             )
 
         except Exception:
-
             logger.exception(
-                "Tick processing failed for %s",
-                symbol,
+                "Tick handling failed "
+                "for %s",
+                clean,
             )
-
-            return []
 
     return handle
 
 
-for symbol in cfg.FOREX_PAIRS:
+# ============================================================
+# CREATE CANDLE MANAGERS
+# ============================================================
 
+for symbol in cfg.FOREX_PAIRS:
     manager = CandleManager(
         symbol=symbol,
-        event_dispatcher=event_dispatcher,
+        event_dispatcher=(
+            event_dispatcher
+        ),
         max_history=getattr(
             cfg,
             "CANDLE_HISTORY_LIMIT",
-            200,
+            1000,
         ),
     )
 
-    candle_managers[symbol] = manager
+    candle_managers[
+        symbol
+    ] = manager
 
-    handler = make_tick_handler(
+    market_client.register_tick_handler(
         symbol,
-        manager,
+        create_tick_handler(
+            symbol,
+            manager,
+        ),
     )
 
-    for var in get_symbol_variants(symbol):
 
-        tick_windows[var] = {}
-
-        deriv_client.register_tick_handler(
-            var,
-            handler,
-        )
-
+# ============================================================
+# LIVE QUOTE
+# ============================================================
 
 def live_quote(symbol):
-    """
-    Return only a genuinely recent live tick.
-
-    Never use a historical candle close as a fake live quote.
-    """
-
-    variants = get_symbol_variants(symbol)
-
-    stale_after = getattr(
-        cfg,
-        "STALE_TICK_THRESHOLD_SEC",
-        25.0,
+    clean = normalize_symbol(
+        symbol
     )
 
     with state_lock:
+        row = live_state.get(
+            clean
+        )
 
-        quote = None
+        if row is None:
+            return None
 
-        for variant in variants:
+        row = dict(row)
 
-            if variant in live_state:
+    max_age = float(
+        getattr(
+            cfg,
+            "STALE_TICK_THRESHOLD_SEC",
+            10.0,
+        )
+    )
 
-                quote = dict(
-                    live_state[variant]
-                )
+    epoch_age = (
+        time.time()
+        - row["epoch"]
+    )
 
-                break
-
-    if quote is None:
-        return None
-
-    now_epoch = deriv_client.get_server_time()
-
-    if (
-        now_epoch
-        - quote["epoch"]
-        > stale_after
-    ):
-        return None
-
-    if (
+    receipt_age = (
         time.monotonic()
-        - quote["receipt"]
-        > stale_after
+        - row["receipt"]
+    )
+
+    if (
+        epoch_age > max_age
+        or receipt_age > max_age
     ):
         return None
 
-    return quote
+    return row
 
+
+# ============================================================
+# HISTORY
+# ============================================================
 
 def history_snapshot(
     symbol,
     timeframe="1M",
 ):
+    manager = (
+        candle_managers.get(
+            symbol
+        )
+    )
 
-    if timeframe != "1M":
+    if manager is None:
+        return pd.DataFrame()
 
-        # 5M/15M candles carry no live tick-verification window;
-        # just return the closed history as CandleManager built it.
-
-        manager = candle_managers.get(symbol)
-
-        if not manager:
-            return pd.DataFrame()
-
-        with state_lock:
-
-            return manager.get_closed_history(
+    try:
+        return (
+            manager
+            .get_closed_history(
                 timeframe
             )
-
-    with state_lock:
-
-        manager = candle_managers.get(symbol)
-
-        if not manager:
-            return pd.DataFrame()
-
-        df = (
-            manager
-            .get_closed_history("1M")
             .copy()
         )
 
-        variants = get_symbol_variants(
-            symbol
-        )
-
-        symbol_windows = {}
-
-        for v in variants:
-
-            if (
-                v in tick_windows
-                and tick_windows[v]
-            ):
-
-                symbol_windows = (
-                    tick_windows[v]
-                )
-
-                break
-
-        windows = {
-            epoch: dict(value)
-            for epoch, value
-            in symbol_windows.items()
-        }
-
-    if (
-        df.empty
-        or "time" not in df.columns
-    ):
-        return df
-
-    def verified_count(epoch):
-
-        epoch = int(epoch)
-
-        window = windows.get(epoch)
-
-        if (
-            window is None
-            or not window.get(
-                "complete",
-                False,
-            )
-        ):
-            return float("nan")
-
-        return float(
-            window["count"]
-        )
-
-    df["verified_ticks"] = (
-        df["time"].map(
-            verified_count
-        )
-    )
-
-    return df
-
-
-def feed_diagnostics(symbol):
-
-    variants = get_symbol_variants(symbol)
-
-    with state_lock:
-
-        quote = None
-
-        for variant in variants:
-
-            if variant in live_state:
-
-                quote = dict(
-                    live_state[variant]
-                )
-
-                break
-
-        manager = candle_managers.get(
-            symbol
-        )
-
-        candle = (
-            manager.get_latest_closed_candle(
-                "1M"
-            )
-            if manager
-            else None
-        )
-
-        last_close = (
-            int(candle.close_epoch)
-            if candle
-            else None
-        )
-
-        manager_diag = (
-            manager.diagnostics("1M")
-            if manager
-            else {}
-        )
-
-    now = deriv_client.get_server_time()
-
-    return {
-        "last_tick_epoch": (
-            quote["epoch"]
-            if quote
-            else None
-        ),
-        "tick_age_seconds": (
-            round(
-                now
-                - quote["epoch"],
-                2,
-            )
-            if quote
-            else None
-        ),
-        "receipt_age_seconds": (
-            round(
-                time.monotonic()
-                - quote["receipt"],
-                2,
-            )
-            if quote
-            else None
-        ),
-        "last_candle_close_epoch":
-            last_close,
-        "history_count_1m":
-            manager_diag.get(
-                "count",
-                0,
-            ),
-        "history_last_epoch_1m":
-            manager_diag.get(
-                "last_epoch"
-            ),
-        "history_gap_count_1m":
-            manager_diag.get(
-                "abnormal_gap_count",
-                0,
-            ),
-    }
-
-
-# ============================================================
-# TELEGRAM DELIVERY
-# ============================================================
-
-def send_telegram_alert(
-    candidate,
-    target_epoch,
-):
-
-    if not getattr(
-        cfg,
-        "TELEGRAM_ENABLED",
-        False,
-    ):
-        return "DISABLED"
-
-    if (
-        not cfg.TELEGRAM_BOT_TOKEN
-        or not cfg.TELEGRAM_CHAT_ID
-    ):
-
-        logger.error(
-            "Telegram configuration missing: "
-            "check token and chat/channel ID."
-        )
-
-        return "CONFIG_ERROR"
-
-    tz = pytz.timezone(
-        getattr(
-            cfg,
-            "TIMEZONE_NAME",
-            "Asia/Dhaka",
-        )
-    )
-
-    expiry = (
-        datetime.datetime
-        .fromtimestamp(
-            target_epoch + 60,
-            tz,
-        )
-    )
-
-    details = candidate["details"]
-
-    trend_5m = details.get(
-        "trend_5m",
-        "UNAVAILABLE",
-    )
-
-    trend_line = (
-        f"📈 5M Trend: {trend_5m}\n"
-        if trend_5m != "UNAVAILABLE"
-        else (
-            "📈 5M Trend: not available "
-            "(skipped - insufficient 5M history)\n"
-        )
-    )
-
-    # This bot analyzes the Deriv quotation feed.
-    # Quotex/OTC candles can differ from Deriv.
-    message = (
-        "⚡️ MARKET ANALYSIS SIGNAL ⚡️\n\n"
-        f"📊 Pair: {candidate['display_name']}\n"
-        f"🎯 Action: {candidate['direction']}\n"
-        f"⭐️ Score: {candidate['score']}/8 "
-        f"({candidate['quality']})\n"
-        f"⏰ Expiry: "
-        f"{expiry.strftime('%H:%M:%S')} "
-        f"{getattr(cfg, 'TIMEZONE_NAME', 'Asia/Dhaka')}\n"
-        f"{trend_line}"
-        f"💡 Reason: "
-        f"{details.get('score_reason', 'N/A')}\n\n"
-        "⚠️ Based on the Deriv quotation feed, "
-        "not Quotex's own candles.\n"
-        "This is not financial advice; "
-        "no signal here guarantees a profitable trade."
-    )
-
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{cfg.TELEGRAM_BOT_TOKEN}/"
-        f"sendMessage"
-    )
-
-    try:
-
-        response = requests.post(
-            url,
-            json={
-                "chat_id":
-                    cfg.TELEGRAM_CHAT_ID,
-                "text":
-                    message,
-            },
-            timeout=(2, 3),
-        )
-
-        body = response.json()
-
-        if (
-            response.status_code == 200
-            and body.get("ok") is True
-        ):
-
-            logger.info(
-                "Telegram SENT for %s %s",
-                candidate["display_name"],
-                candidate["direction"],
-            )
-
-            return "SENT"
-
-        return "REJECTED"
-
     except Exception:
+        return pd.DataFrame()
 
-        return "UNKNOWN"
 
+def seed_history():
+    jobs = []
 
-# ============================================================
-# SIGNAL RECORDING AND DISPATCH
-# ============================================================
+    for symbol in (
+        cfg.FOREX_PAIRS
+    ):
+        jobs.append(
+            {
+                "key":
+                    symbol,
+                "symbol":
+                    symbol,
+                "count":
+                    getattr(
+                        cfg,
+                        "SIM_HISTORY_LIMIT",
+                        1000,
+                    ),
+                "granularity":
+                    60,
+            }
+        )
 
-def save_signal(
-    candidate,
-    target_epoch,
-    entry_price,
-):
-
-    tz = pytz.timezone(
-        getattr(
-            cfg,
-            "TIMEZONE_NAME",
-            "Asia/Dhaka",
+    histories = (
+        market_client
+        .fetch_historical_candles_batch_sync(
+            jobs
         )
     )
 
-    utc_now = (
-        datetime.datetime.now(
-            datetime.timezone.utc
+    server_epoch = int(
+        market_client
+        .get_server_time()
+    )
+
+    success = 0
+
+    for symbol, manager in (
+        candle_managers.items()
+    ):
+        raw = histories.get(
+            symbol,
+            [],
         )
-    )
 
-    local_now = utc_now.astimezone(
-        tz
-    )
+        if not raw:
+            continue
 
-    signal_id = (
-        f"{candidate['symbol']}"
-        f"_1M_"
-        f"{target_epoch}"
-    )
+        try:
+            manager.seed_historical_candles(
+                "1M",
+                raw,
+                server_epoch,
+            )
 
-    conn = get_db_connection()
+            success += 1
 
-    try:
-
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO signal_history (
-                signal_id,
+        except Exception:
+            logger.exception(
+                "History seed failed "
+                "for %s",
                 symbol,
-                display_pair,
-                timeframe,
-                candle_epoch,
-                signal_timestamp_utc,
-                signal_timestamp_bdt,
-                direction,
-                score,
-                quality,
-                bias_15m,
-                entry_reference_price,
-                entry_reference_timestamp,
-                created_at,
-                result
             )
-            VALUES (
-                ?, ?, ?, '1M', ?, ?, ?, ?, ?, ?,
-                'NOT_USED', ?, ?, ?, 'PENDING'
-            )
-            """,
-            (
-                signal_id,
-                candidate["symbol"],
-                candidate["display_name"],
-                target_epoch,
-                utc_now.isoformat(),
-                local_now.isoformat(),
-                candidate["direction"],
-                candidate["score"],
-                candidate["quality"],
-                entry_price,
-                utc_now.isoformat(),
-                local_now.isoformat(),
-            ),
-        )
 
-        conn.commit()
-
-    finally:
-
-        conn.close()
+    logger.info(
+        "Synthetic history seeded "
+        "for %s/%s symbols.",
+        success,
+        len(
+            cfg.FOREX_PAIRS
+        ),
+    )
 
 
-def dispatch_best_signal(
+# ============================================================
+# PAPER SIGNAL RECORDING
+# ============================================================
+
+def record_paper_signal(
     candidate,
     target_epoch,
 ):
-
     quote = live_quote(
         candidate["symbol"]
     )
 
     if quote is None:
-
-        diag = feed_diagnostics(
-            candidate["symbol"]
-        )
-
         logger.warning(
-            "Dispatch blocked for %s: "
-            "no fresh live quote within %.1fs "
-            "diag=%s",
+            "PAPER_SIGNAL skipped "
+            "%s: no current "
+            "synthetic quote",
             candidate["symbol"],
-            float(
-                getattr(
-                    cfg,
-                    "STALE_TICK_THRESHOLD_SEC",
-                    25.0,
-                )
-            ),
-            diag,
         )
 
-        return "NO_FRESH_QUOTE"
-
-    # Diagnostic build defaults to PAPER_MODE.
-    # It lets the entire market-data + strategy pipeline run
-    # without sending a live Telegram trade instruction.
-    if getattr(
-        cfg,
-        "PAPER_MODE",
-        True,
-    ):
-
-        logger.info(
-            "PAPER_SIGNAL "
-            "symbol=%s "
-            "direction=%s "
-            "score=%s "
-            "target=%s "
-            "entry_ref=%s",
-            candidate["symbol"],
-            candidate["direction"],
-            candidate["score"],
-            target_epoch,
-            quote["price"],
-        )
-
-        return "PAPER"
-
-    if not getattr(
-        cfg,
-        "TELEGRAM_ENABLED",
-        False,
-    ):
-        return "DISABLED"
-
-    if not reserve_dispatch(
-        candidate["symbol"],
-        candidate["details"]["setup_id"],
-        target_epoch,
-    ):
-        return "DUPLICATE"
-
-    status = send_telegram_alert(
-        candidate,
-        target_epoch,
-    )
-
-    set_dispatch_status(
-        target_epoch,
-        status,
-    )
-
-    if status == "SENT":
-
-        try:
-
-            save_signal(
-                candidate,
-                target_epoch,
-                quote["price"],
-            )
-
-        except Exception:
-
-            logger.exception(
-                "save_signal failed after "
-                "SENT Telegram alert for %s %s",
-                candidate["symbol"],
-                candidate["direction"],
-            )
-
-        if pusher_client:
-
-            try:
-
-                pusher_client.trigger(
-                    "trading-signals",
-                    "new-signal",
-                    {
-                        "pair":
-                            candidate[
-                                "display_name"
-                            ],
-                        "direction":
-                            candidate[
-                                "direction"
-                            ],
-                        "score":
-                            candidate[
-                                "score"
-                            ],
-                        "quality":
-                            candidate[
-                                "quality"
-                            ],
-                        "trend_5m":
-                            candidate[
-                                "details"
-                            ].get(
-                                "trend_5m",
-                                "UNAVAILABLE",
-                            ),
-                        "timeframe":
-                            "1M",
-                        "target_candle_epoch":
-                            target_epoch,
-                        "expiry_epoch":
-                            target_epoch + 60,
-                    },
-                )
-
-            except Exception:
-
-                logger.exception(
-                    "Pusher trigger failed for %s",
-                    candidate["symbol"],
-                )
-
-    return status
-
-
-# ============================================================
-# HISTORY DIAGNOSTICS
-# ============================================================
-
-def _history_counts(df):
-
-    if (
-        df is None
-        or getattr(
-            df,
-            "empty",
-            True,
-        )
-        or "time" not in df.columns
-    ):
-
-        return (
-            0,
-            None,
-            None,
-            0,
-        )
-
-    times = [
-        int(x)
-        for x in df["time"].tolist()
-    ]
-
-    gaps = [
-        times[i]
-        - times[i - 1]
-        for i in range(
-            1,
-            len(times),
-        )
-    ]
-
-    abnormal = [
-        gap
-        for gap in gaps
-        if gap != 60
-    ]
-
-    return (
-        len(times),
-        times[0],
-        times[-1],
-        (
-            abnormal[-1]
-            if abnormal
-            else 0
-        ),
-    )
-
-
-def _log_history_problem_once(
-    symbol,
-    target_epoch,
-    reason,
-    raw_df,
-    prepared_df,
-    expected_last_epoch,
-):
-
-    if not getattr(
-        cfg,
-        "HISTORY_DIAGNOSTICS",
-        True,
-    ):
         return
 
-    key = (
-        symbol,
-        int(target_epoch),
-        reason,
-    )
+    item = {
+        "timestamp":
+            int(
+                time.time()
+            ),
+        "target_epoch":
+            int(
+                target_epoch
+            ),
+        "symbol":
+            candidate[
+                "symbol"
+            ],
+        "pair":
+            candidate[
+                "display_name"
+            ],
+        "direction":
+            candidate[
+                "direction"
+            ],
+        "score":
+            candidate[
+                "score"
+            ],
+        "quality":
+            candidate[
+                "quality"
+            ],
+        "entry_reference":
+            quote["price"],
+        "mode":
+            "PAPER_SYNTHETIC",
+    }
 
     with state_lock:
-
-        if key in history_diagnostic_seen:
-            return
-
-        history_diagnostic_seen.add(
-            key
+        paper_signals.insert(
+            0,
+            item,
         )
 
-        # Bound memory usage to roughly
-        # the latest few minutes.
-        if (
-            len(
-                history_diagnostic_seen
-            )
-            > 500
-        ):
+        del paper_signals[
+            100:
+        ]
 
-            cutoff = (
-                int(target_epoch)
-                - 600
-            )
-
-            recent = {
-                x
-                for x
-                in history_diagnostic_seen
-                if x[1] >= cutoff
-            }
-
-            history_diagnostic_seen.clear()
-
-            history_diagnostic_seen.update(
-                recent
-            )
-
-    (
-        raw_count,
-        raw_first,
-        raw_last,
-        raw_gap,
-    ) = _history_counts(
-        raw_df
-    )
-
-    (
-        prep_count,
-        prep_first,
-        prep_last,
-        prep_gap,
-    ) = _history_counts(
-        prepared_df
-    )
-
-    logger.warning(
-        "HISTORY_DIAG %s "
-        "reason=%s "
-        "expected_last=%s "
-        "raw_count=%s "
-        "raw_first=%s "
-        "raw_last=%s "
-        "raw_latest_gap=%s "
-        "prepared_count=%s "
-        "prepared_first=%s "
-        "prepared_last=%s "
-        "prepared_latest_gap=%s",
-        symbol,
-        reason,
-        expected_last_epoch,
-        raw_count,
-        raw_first,
-        raw_last,
-        raw_gap,
-        prep_count,
-        prep_first,
-        prep_last,
-        prep_gap,
+    logger.info(
+        "PAPER_SIGNAL "
+        "%s %s score=%s "
+        "entry=%s",
+        candidate[
+            "display_name"
+        ],
+        candidate[
+            "direction"
+        ],
+        candidate[
+            "score"
+        ],
+        quote["price"],
     )
 
 
 # ============================================================
-# MINUTE-BOUNDARY CLOSED-CANDLE REPAIR
+# STRATEGY EVALUATION
 # ============================================================
 
-def _symbols_missing_expected_closed_candle(
-    expected_epoch,
-):
-
-    missing = []
-
-    for symbol, manager in (
-        candle_managers.items()
-    ):
-
-        latest = (
-            manager.get_latest_closed_candle(
-                "1M"
-            )
-        )
-
-        if (
-            latest is None
-            or int(latest.epoch)
-            != int(expected_epoch)
-        ):
-
-            missing.append(
-                symbol
-            )
-
-    return missing
-
-
-def ensure_latest_closed_candles(
+def evaluate_all(
     target_epoch,
 ):
-    """
-    Make the candle immediately before target_epoch available
-    before strategy evaluation.
+    reports = {}
 
-    Live candles normally close when the first tick of the new
-    minute arrives.
+    candidates = []
 
-    On Render that first tick can be delayed. We repair only
-    missing symbols with a small REST candle request.
-
-    No forming candle is guessed or force-closed from a stale price.
-    """
-
-    expected_epoch = (
+    expected_last = (
         int(target_epoch)
         - 60
     )
 
-    missing = (
-        _symbols_missing_expected_closed_candle(
-            expected_epoch
-        )
-    )
+    for (
+        symbol,
+        display,
+    ) in cfg.FOREX_PAIRS.items():
 
-    if not missing:
-        return 0, 0
+        report = {
+            "symbol":
+                symbol,
+            "pair":
+                display,
+            "direction":
+                "NO_TRADE",
+            "score":
+                0,
+            "quality":
+                "WAIT",
+            "mode":
+                "PAPER_SYNTHETIC",
+        }
 
-    # Avoid colliding with the periodic
-    # full-history refresh.
-    if not history_lock.acquire(
-        blocking=False
-    ):
-        return (
-            0,
-            len(missing),
-        )
-
-    started = time.monotonic()
-
-    try:
-
-        # Re-check after lock.
-        missing = (
-            _symbols_missing_expected_closed_candle(
-                expected_epoch
-            )
-        )
-
-        if not missing:
-            return 0, 0
-
-        recent_count = max(
-            3,
-            int(
-                getattr(
-                    cfg,
-                    "BOUNDARY_SYNC_CANDLE_COUNT",
-                    4,
-                )
-            ),
-        )
-
-        jobs = [
-            {
-                "key":
-                    f"{symbol}:1M",
-                "symbol":
-                    symbol,
-                "count":
-                    recent_count,
-                "granularity":
-                    60,
-            }
-            for symbol in missing
-        ]
-
-        histories = (
-            deriv_client
-            .fetch_historical_candles_batch_sync(
-                jobs,
-                timeout=float(
-                    getattr(
-                        cfg,
-                        "BOUNDARY_SYNC_TIMEOUT_SECONDS",
-                        2.0,
-                    )
-                ),
-                allow_fallback=False,
-            )
-        )
-
-        # target_epoch is already current minute,
-        # so previous minute is safely closed.
-        server_epoch = max(
-            int(
-                deriv_client.get_server_time()
-            ),
-            int(target_epoch),
-        )
-
-        for symbol in missing:
-
-            raw = histories.get(
-                f"{symbol}:1M",
-                [],
+        try:
+            raw = history_snapshot(
+                symbol,
+                "1M",
             )
 
-            if not raw:
+            if (
+                raw.empty
+                or "time"
+                not in raw.columns
+            ):
+                report[
+                    "reason"
+                ] = "NO_HISTORY"
+
+                reports[
+                    display
+                ] = report
+
                 continue
 
-            manager = (
-                candle_managers[symbol]
+            raw = raw[
+                raw["time"]
+                <= expected_last
+            ].reset_index(
+                drop=True
             )
 
-            with state_lock:
-
-                manager.seed_historical_candles(
-                    "1M",
-                    raw,
-                    server_epoch,
+            prepared = (
+                prepare_history(
+                    raw
                 )
-
-        remaining = (
-            _symbols_missing_expected_closed_candle(
-                expected_epoch
             )
-        )
 
-        repaired = (
-            len(missing)
-            - len(remaining)
-        )
-
-        elapsed_ms = int(
-            (
-                time.monotonic()
-                - started
-            )
-            * 1000
-        )
-
-        logger.info(
-            "Boundary candle sync: "
-            "target=%s "
-            "expected=%s "
-            "requested=%s "
-            "repaired=%s "
-            "remaining=%s "
-            "elapsed_ms=%s",
-            int(target_epoch),
-            expected_epoch,
-            len(missing),
-            repaired,
-            len(remaining),
-            elapsed_ms,
-        )
-
-        return (
-            repaired,
-            len(remaining),
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Boundary candle sync failed "
-            "for target=%s",
-            target_epoch,
-        )
-
-        remaining = (
-            _symbols_missing_expected_closed_candle(
-                expected_epoch
-            )
-        )
-
-        return (
-            0,
-            len(remaining),
-        )
-
-    finally:
-
-        history_lock.release()
-
-
-# ============================================================
-# ALL-PAIR EVALUATION AND RANKING
-# ============================================================
-
-def evaluate_and_dispatch_all(
-    target_epoch,
-):
-
-    if not evaluation_lock.acquire(
-        blocking=False
-    ):
-        return
-
-    try:
-
-        # Repair just-closed minute before
-        # strategy evaluation.
-        ensure_latest_closed_candles(
-            target_epoch
-        )
-
-        candidates = []
-        reports = {}
-
-        timestamp = (
-            datetime.datetime.now(
-                pytz.timezone(
-                    getattr(
-                        cfg,
-                        "TIMEZONE_NAME",
-                        "Asia/Dhaka",
-                    )
-                )
-            ).isoformat()
-        )
-
-        for symbol, display in (
-            cfg.FOREX_PAIRS.items()
-        ):
-
-            report = {
-                "timestamp":
-                    timestamp,
-                "direction":
-                    "NO_TRADE",
-                "score":
-                    0,
-                "quality":
-                    "WAIT",
-                "bias":
-                    "NOT_USED",
-                "target_candle_epoch":
-                    target_epoch,
-                "expected_close_epoch":
-                    target_epoch,
-                "delivery":
-                    "NOT_SENT",
-            }
-
-            try:
-
-                report.update(
-                    feed_diagnostics(
-                        symbol
-                    )
-                )
-
-                raw_df = history_snapshot(
-                    symbol
-                )
-
-                expected_last_epoch = (
-                    int(target_epoch)
-                    - 60
-                )
-
-                if (
-                    raw_df.empty
-                    or "time"
-                    not in raw_df.columns
-                ):
-
-                    report[
-                        "score_reason"
-                    ] = "NO_1M_HISTORY"
-
-                    _log_history_problem_once(
-                        symbol,
-                        target_epoch,
-                        report[
-                            "score_reason"
-                        ],
-                        raw_df,
-                        raw_df,
-                        expected_last_epoch,
-                    )
-
-                    reports[
-                        display
-                    ] = report
-
-                    continue
-
-                # Never analyze the currently forming minute.
-                raw_df = (
-                    raw_df[
-                        raw_df["time"]
-                        <= expected_last_epoch
-                    ]
-                    .reset_index(
-                        drop=True
-                    )
-                )
-
-                df = (
-                    prepare_history(
-                        raw_df
-                    )
-                    if not raw_df.empty
-                    else raw_df
-                )
-
-                min_history = getattr(
+            if (
+                prepared.empty
+                or len(prepared)
+                < getattr(
                     cfg,
                     "MIN_1M_HISTORY",
                     20,
                 )
-
-                if len(raw_df) < min_history:
-
-                    report[
-                        "score_reason"
-                    ] = (
-                        "INSUFFICIENT_"
-                        "RAW_1M_HISTORY"
-                    )
-
-                    _log_history_problem_once(
-                        symbol,
-                        target_epoch,
-                        report[
-                            "score_reason"
-                        ],
-                        raw_df,
-                        df,
-                        expected_last_epoch,
-                    )
-
-                    reports[
-                        display
-                    ] = report
-
-                    continue
-
-                if (
-                    df.empty
-                    or len(df)
-                    < min_history
-                ):
-
-                    report[
-                        "score_reason"
-                    ] = (
-                        "INSUFFICIENT_"
-                        "CONTIGUOUS_1M_HISTORY"
-                    )
-
-                    _log_history_problem_once(
-                        symbol,
-                        target_epoch,
-                        report[
-                            "score_reason"
-                        ],
-                        raw_df,
-                        df,
-                        expected_last_epoch,
-                    )
-
-                    reports[
-                        display
-                    ] = report
-
-                    continue
-
-                latest_analysis_epoch = int(
-                    df.iloc[-1][
-                        "time"
-                    ]
+            ):
+                report[
+                    "reason"
+                ] = (
+                    "INSUFFICIENT_HISTORY"
                 )
 
-                if (
-                    latest_analysis_epoch
-                    != expected_last_epoch
-                ):
+                reports[
+                    display
+                ] = report
 
-                    report[
-                        "score_reason"
-                    ] = (
-                        "LATEST_CLOSED_"
-                        "CANDLE_MISSING"
-                    )
+                continue
 
-                    _log_history_problem_once(
-                        symbol,
-                        target_epoch,
-                        report[
-                            "score_reason"
-                        ],
-                        raw_df,
-                        df,
-                        expected_last_epoch,
-                    )
+            latest_epoch = int(
+                prepared.iloc[-1][
+                    "time"
+                ]
+            )
 
-                    reports[
-                        display
-                    ] = report
+            if (
+                latest_epoch
+                != expected_last
+            ):
+                report[
+                    "reason"
+                ] = (
+                    "LATEST_CANDLE_"
+                    "NOT_READY"
+                )
 
-                    continue
+                reports[
+                    display
+                ] = report
 
-                # Real 5M context.
-                df_5m = history_snapshot(
+                continue
+
+            df_5m = (
+                history_snapshot(
                     symbol,
                     "5M",
                 )
+            )
 
-                adx_5m = None
+            (
+                direction,
+                score,
+                quality,
+                details,
+            ) = evaluate_strategy(
+                prepared,
+                df_5m,
+                {
+                    "adx_5m":
+                        None
+                },
+            )
 
-                min_5m = getattr(
-                    cfg,
-                    "CONTEXT_5M_MIN_CANDLES",
-                    10,
-                )
+            report.update(
+                {
+                    "direction":
+                        direction,
+                    "score":
+                        score,
+                    "quality":
+                        quality,
+                    "reason":
+                        details.get(
+                            "score_reason",
+                            "EVALUATED",
+                        ),
+                    "structure":
+                        details.get(
+                            "structure"
+                        ),
+                    "trend_5m":
+                        details.get(
+                            "trend_5m"
+                        ),
+                    "call_score":
+                        details.get(
+                            "call_score"
+                        ),
+                    "put_score":
+                        details.get(
+                            "put_score"
+                        ),
+                    "analysis_epoch":
+                        latest_epoch,
+                }
+            )
 
-                if (
-                    not df_5m.empty
-                    and len(df_5m)
-                    >= min_5m
-                ):
-
-                    try:
-
-                        adx_series = (
-                            calculate_adx(
-                                df_5m,
-                                period=14,
-                            )
-                        )
-
-                        if (
-                            len(adx_series)
-                            > 0
-                        ):
-
-                            last_adx = float(
-                                adx_series.iloc[
-                                    -1
-                                ]
-                            )
-
-                            if math.isfinite(
-                                last_adx
-                            ):
-
-                                adx_5m = (
-                                    last_adx
-                                )
-
-                    except Exception:
-
-                        adx_5m = None
-
-                (
-                    direction,
-                    score,
-                    quality,
-                    details,
-                ) = evaluate_strategy(
-                    df,
-                    df_5m,
+            if direction in (
+                "CALL",
+                "PUT",
+            ):
+                candidates.append(
                     {
-                        "adx_5m":
-                            adx_5m
-                    },
-                )
-
-                report.update(
-                    {
+                        "symbol":
+                            symbol,
+                        "display_name":
+                            display,
                         "direction":
                             direction,
                         "score":
@@ -1609,988 +602,199 @@ def evaluate_and_dispatch_all(
                         "quality":
                             quality,
                         "details":
-                            details.get(
-                                "pa"
-                            ),
-                        "score_reason":
-                            details.get(
-                                "score_reason",
-                                "EVALUATED",
-                            ),
-                        "structure":
-                            details.get(
-                                "structure",
-                                "N/A",
-                            ),
-                        "trend_5m":
-                            details.get(
-                                "trend_5m",
-                                "UNAVAILABLE",
-                            ),
-                        "call_score":
-                            details.get(
-                                "call_score",
-                                0,
-                            ),
-                        "put_score":
-                            details.get(
-                                "put_score",
-                                0,
-                            ),
-                        "activity_status":
-                            details.get(
-                                "activity_status",
-                                "ACTIVE",
-                            ),
-                        "relative_activity":
-                            details.get(
-                                "relative_activity",
-                                1.0,
-                            ),
-                        "analysis_candle_epoch":
-                            int(
-                                df.iloc[-1][
-                                    "time"
-                                ]
-                            ),
+                            details,
                     }
                 )
 
-                if direction in (
-                    "CALL",
-                    "PUT",
-                ):
-
-                    if used_setup(
-                        symbol,
-                        details.get(
-                            "setup_id",
-                            "",
-                        ),
-                    ):
-
-                        report[
-                            "delivery"
-                        ] = (
-                            "SETUP_ALREADY_"
-                            "ATTEMPTED"
-                        )
-
-                    else:
-
-                        candidates.append(
-                            {
-                                "symbol":
-                                    symbol,
-                                "display_name":
-                                    display,
-                                "direction":
-                                    direction,
-                                "score":
-                                    score,
-                                "quality":
-                                    quality,
-                                "details":
-                                    details,
-                                "analysis_close":
-                                    float(
-                                        df.iloc[
-                                            -1
-                                        ][
-                                            "close"
-                                        ]
-                                    ),
-                            }
-                        )
-
-            except Exception as exc:
-
-                report[
-                    "score_reason"
-                ] = (
-                    f"DATA_ERROR:"
-                    f"{type(exc).__name__}"
-                )
-
-            reports[
-                display
-            ] = report
-
-        candidates.sort(
-            key=lambda c: (
-                -c["score"],
-                -c[
-                    "details"
-                ].get(
-                    "rank_strength",
-                    0,
-                ),
-                c["symbol"],
+        except Exception as exc:
+            report[
+                "reason"
+            ] = (
+                f"ERROR:"
+                f"{type(exc).__name__}"
             )
+
+            logger.exception(
+                "Evaluation failed "
+                "for %s",
+                symbol,
+            )
+
+        reports[
+            display
+        ] = report
+
+    candidates.sort(
+        key=lambda x: (
+            -x["score"],
+            x["symbol"],
+        )
+    )
+
+    with state_lock:
+        latest_evaluations.clear()
+
+        latest_evaluations.update(
+            reports
         )
 
-        history_problem_reasons = {
-            "NO_1M_HISTORY",
-            "INSUFFICIENT_RAW_1M_HISTORY",
-            "INSUFFICIENT_CONTIGUOUS_1M_HISTORY",
-            "LATEST_CLOSED_CANDLE_MISSING",
-        }
+    logger.info(
+        "Paper scan: "
+        "%s symbols, "
+        "%s candidates.",
+        len(reports),
+        len(candidates),
+    )
 
-        missing_count = sum(
-            1
-            for report
-            in reports.values()
-            if report.get(
-                "score_reason"
-            )
-            in history_problem_reasons
+    if candidates:
+        record_paper_signal(
+            candidates[0],
+            target_epoch,
         )
-
-        logger.info(
-            "Scan: %s pairs, "
-            "%s candidates, "
-            "missing_candles=%s, "
-            "signals_enabled=%s",
-            len(reports),
-            len(candidates),
-            missing_count,
-            cfg.SIGNALS_ENABLED,
-        )
-
-        if (
-            candidates
-            and cfg.SIGNALS_ENABLED
-        ):
-
-            best_candidate = (
-                candidates[0]
-            )
-
-            status = (
-                dispatch_best_signal(
-                    best_candidate,
-                    target_epoch,
-                )
-            )
-
-            reports[
-                best_candidate[
-                    "display_name"
-                ]
-            ][
-                "delivery"
-            ] = status
-
-        with state_lock:
-
-            latest_evaluations.clear()
-
-            latest_evaluations.update(
-                reports
-            )
-
-    finally:
-
-        evaluation_lock.release()
 
 
 # ============================================================
-# HISTORICAL DATA REFRESH
+# SCANNER
 # ============================================================
 
-def resync_historical_candles():
-
-    if not history_lock.acquire(
-        blocking=False
-    ):
-        return
-
-    try:
-
-        jobs = [
-            {
-                "key":
-                    f"{symbol}:1M",
-                "symbol":
-                    symbol,
-                "count":
-                    getattr(
-                        cfg,
-                        "CANDLE_HISTORY_LIMIT",
-                        100,
-                    ),
-                "granularity":
-                    60,
-            }
-            for symbol
-            in cfg.FOREX_PAIRS
-        ]
-
-        histories = (
-            deriv_client
-            .fetch_historical_candles_batch_sync(
-                jobs
-            )
-        )
-
-        server_epoch = int(
-            deriv_client
-            .fetch_server_epoch_sync()
-        )
-
-        updated = 0
-        stored_ok = 0
-
-        for symbol, manager in (
-            candle_managers.items()
-        ):
-
-            raw = histories.get(
-                f"{symbol}:1M",
-                [],
-            )
-
-            if not raw:
-
-                logger.warning(
-                    "History refresh %s: "
-                    "API returned 0 candles",
-                    symbol,
-                )
-
-                continue
-
-            with state_lock:
-
-                manager.seed_historical_candles(
-                    "1M",
-                    raw,
-                    server_epoch,
-                )
-
-                diag_1m = (
-                    manager.diagnostics(
-                        "1M"
-                    )
-                )
-
-                diag_5m = (
-                    manager.diagnostics(
-                        "5M"
-                    )
-                )
-
-            updated += 1
-
-            if (
-                diag_1m.get(
-                    "count",
-                    0,
-                )
-                >= getattr(
-                    cfg,
-                    "MIN_1M_HISTORY",
-                    20,
-                )
-            ):
-
-                stored_ok += 1
-
-            if getattr(
-                cfg,
-                "HISTORY_DIAGNOSTICS",
-                True,
-            ):
-
-                logger.info(
-                    "History %s: "
-                    "api=%s "
-                    "stored1m=%s "
-                    "last1m=%s "
-                    "gaps1m=%s "
-                    "stored5m=%s "
-                    "last5m=%s",
-                    symbol,
-                    len(raw),
-                    diag_1m.get(
-                        "count",
-                        0,
-                    ),
-                    diag_1m.get(
-                        "last_epoch"
-                    ),
-                    diag_1m.get(
-                        "abnormal_gap_count",
-                        0,
-                    ),
-                    diag_5m.get(
-                        "count",
-                        0,
-                    ),
-                    diag_5m.get(
-                        "last_epoch"
-                    ),
-                )
-
-        logger.info(
-            "M1 history refreshed for "
-            "%s/%s pairs; "
-            "%s/%s have >=%s "
-            "stored 1M candles.",
-            updated,
-            len(
-                cfg.FOREX_PAIRS
-            ),
-            stored_ok,
-            len(
-                cfg.FOREX_PAIRS
-            ),
-            getattr(
-                cfg,
-                "MIN_1M_HISTORY",
-                20,
-            ),
-        )
-
-    except Exception:
-
-        logger.exception(
-            "History refresh failed."
-        )
-
-    finally:
-
-        history_lock.release()
-
-
-def run_history_worker():
-
+def scanner_worker():
     ready.wait()
 
     last_minute = None
 
     while True:
-
         try:
-
-            now = (
-                deriv_client
-                .get_server_time()
+            now = int(
+                time.time()
             )
 
             minute = (
-                int(now // 60)
-                * 60
-            )
+                now // 60
+            ) * 60
 
-            if (
-                10
-                <= (now % 60)
-                < 30
-                and minute
-                != last_minute
-            ):
-
-                last_minute = (
-                    minute
-                )
-
-                resync_historical_candles()
-
-            time.sleep(1.0)
-
-        except Exception:
-
-            logger.exception(
-                "History worker failed."
-            )
-
-            time.sleep(2)
-
-
-# ============================================================
-# SCAN RETRIES WITHIN THE ENTRY WINDOW
-# ============================================================
-
-def run_scan_worker():
-
-    ready.wait()
-
-    active_minute = None
-    finished_minute = None
-    last_attempt = 0.0
-
-    while True:
-
-        try:
-
-            now = (
-                deriv_client
-                .get_server_time()
-            )
-
-            minute = (
-                int(now // 60)
-                * 60
-            )
-
-            second = (
+            seconds = (
                 now - minute
             )
 
             if (
                 minute
-                != active_minute
+                != last_minute
+                and seconds
+                >= getattr(
+                    cfg,
+                    "SCAN_DELAY_SECONDS",
+                    2,
+                )
             ):
-
-                active_minute = minute
-                last_attempt = 0.0
-
-            if (
-                minute
-                == finished_minute
-            ):
-
-                time.sleep(0.5)
-
-                continue
-
-            scan_delay = getattr(
-                cfg,
-                "SCAN_DELAY_SECONDS",
-                2.0,
-            )
-
-            max_delay = getattr(
-                cfg,
-                "MAX_ENTRY_DELAY_SECONDS",
-                10.0,
-            )
-
-            if second > max_delay:
-
-                finished_minute = (
+                evaluate_all(
                     minute
                 )
 
-                time.sleep(0.5)
-
-                continue
-
-            if second < scan_delay:
-
-                time.sleep(0.5)
-
-                continue
-
-            if minute_has_dispatch_attempt(
-                minute
-            ):
-
-                finished_minute = (
+                last_minute = (
                     minute
                 )
 
-                time.sleep(0.5)
-
-                continue
-
-            monotonic_now = (
-                time.monotonic()
+            time.sleep(
+                0.5
             )
-
-            if (
-                monotonic_now
-                - last_attempt
-                < 2.0
-            ):
-
-                time.sleep(0.3)
-
-                continue
-
-            last_attempt = (
-                monotonic_now
-            )
-
-            evaluate_and_dispatch_all(
-                minute
-            )
-
-            attempted = (
-                minute_has_dispatch_attempt(
-                    minute
-                )
-            )
-
-            if attempted:
-
-                finished_minute = (
-                    minute
-                )
-
-            time.sleep(0.5)
 
         except Exception:
-
             logger.exception(
-                "Scan worker failed."
+                "Paper scanner failed."
             )
 
-            time.sleep(1)
+            time.sleep(
+                2
+            )
 
 
 # ============================================================
-# ENGINE STARTUP
+# ENGINE
 # ============================================================
 
-def run_engine():
-
+def engine_worker():
     try:
+        # Seed historical data first.
+        seed_history()
 
-        deriv_client.start()
-
-        wait_start = (
-            time.time()
-        )
-
-        while (
-            not deriv_client.is_connected
-            and time.time()
-            - wait_start
-            < 10
-        ):
-
-            time.sleep(0.5)
-
-        resync_historical_candles()
+        # Start synthetic live ticks.
+        market_client.start()
 
         ready.set()
 
         logger.info(
-            "Data engine initialized "
-            "and history seeded. "
-            "Signals are now active."
+            "OFFLINE PAPER ENGINE "
+            "READY. "
+            "No external market "
+            "service is connected."
         )
 
     except Exception:
-
         logger.exception(
-            "Data engine failed to start."
+            "Paper engine startup "
+            "failed."
         )
 
 
 # ============================================================
-# HYPOTHETICAL OUTCOMES
-# ============================================================
-
-def _prune_dispatch_ledger(
-    older_than_seconds: int = 86400,
-):
-
-    conn = get_db_connection()
-
-    try:
-
-        cutoff = (
-            int(time.time())
-            - older_than_seconds
-        )
-
-        conn.execute(
-            """
-            DELETE FROM dispatch_ledger_v2
-            WHERE target_epoch < ?
-            """,
-            (
-                cutoff,
-            ),
-        )
-
-        conn.commit()
-
-    except Exception:
-
-        logger.exception(
-            "Dispatch ledger prune failed."
-        )
-
-    finally:
-
-        conn.close()
-
-
-def run_outcome_worker():
-
-    last_prune = 0.0
-
-    while True:
-
-        time.sleep(10)
-
-        now_monotonic = (
-            time.monotonic()
-        )
-
-        if (
-            now_monotonic
-            - last_prune
-            > 3600
-        ):
-
-            _prune_dispatch_ledger()
-
-            last_prune = (
-                now_monotonic
-            )
-
-        conn = None
-
-        try:
-
-            conn = (
-                get_db_connection()
-            )
-
-            rows = conn.execute(
-                """
-                SELECT
-                    signal_id,
-                    symbol,
-                    candle_epoch,
-                    direction,
-                    entry_reference_price
-                FROM signal_history
-                WHERE result = 'PENDING'
-                """
-            ).fetchall()
-
-            now = (
-                deriv_client
-                .get_server_time()
-            )
-
-            for (
-                signal_id,
-                symbol,
-                target,
-                direction,
-                entry,
-            ) in rows:
-
-                if (
-                    not entry
-                    or symbol
-                    not in candle_managers
-                    or now
-                    < int(target) + 60
-                ):
-
-                    continue
-
-                df = history_snapshot(
-                    symbol
-                )
-
-                if (
-                    df.empty
-                    or "time"
-                    not in df.columns
-                ):
-
-                    continue
-
-                match = df[
-                    df["time"]
-                    == int(target)
-                ]
-
-                if match.empty:
-                    continue
-
-                exit_price = float(
-                    match.iloc[-1][
-                        "close"
-                    ]
-                )
-
-                difference = (
-                    exit_price
-                    - float(entry)
-                )
-
-                if direction == "PUT":
-
-                    difference = (
-                        -difference
-                    )
-
-                elif direction != "CALL":
-
-                    continue
-
-                if difference > 0:
-
-                    outcome = "WIN"
-
-                elif difference < 0:
-
-                    outcome = "LOSS"
-
-                else:
-
-                    outcome = "TIE"
-
-                conn.execute(
-                    """
-                    UPDATE signal_history
-                    SET
-                        result = ?,
-                        exit_reference_price = ?
-                    WHERE
-                        signal_id = ?
-                        AND result = 'PENDING'
-                    """,
-                    (
-                        outcome,
-                        exit_price,
-                        signal_id,
-                    ),
-                )
-
-            conn.commit()
-
-        except Exception:
-
-            logger.exception(
-                "Hypothetical outcome "
-                "calculation failed."
-            )
-
-        finally:
-
-            if conn is not None:
-                conn.close()
-
-
-# ============================================================
-# LIVE TICK HEALTH WORKER
-# ============================================================
-
-def run_tick_health_worker():
-
-    ready.wait()
-
-    interval = float(
-        getattr(
-            cfg,
-            "TICK_HEALTH_LOG_INTERVAL_SECONDS",
-            15.0,
-        )
-    )
-
-    stale_after = float(
-        getattr(
-            cfg,
-            "TICK_RESUBSCRIBE_AFTER_SECONDS",
-            45.0,
-        )
-    )
-
-    while True:
-
-        try:
-
-            diag = (
-                deriv_client
-                .diagnostics()
-            )
-
-            symbols = diag.get(
-                "symbols",
-                {},
-            )
-
-            fresh = 0
-            stale = []
-
-            for symbol in (
-                cfg.FOREX_PAIRS
-            ):
-
-                target = (
-                    deriv_client
-                    ._deriv_symbol(
-                        symbol
-                    )
-                )
-
-                row = symbols.get(
-                    target,
-                    {},
-                )
-
-                age = row.get(
-                    "receipt_age_seconds"
-                )
-
-                if (
-                    age is not None
-                    and age
-                    <= getattr(
-                        cfg,
-                        "STALE_TICK_THRESHOLD_SEC",
-                        25.0,
-                    )
-                ):
-
-                    fresh += 1
-
-                else:
-
-                    stale.append(
-                        target
-                    )
-
-            requested = []
-
-            if getattr(
-                cfg,
-                "PAPER_MODE",
-                True,
-            ):
-
-                requested = (
-                    deriv_client
-                    .resubscribe_stale_symbols(
-                        stale_after
-                    )
-                )
-
-            logger.info(
-                "TICK_HEALTH "
-                "connected=%s "
-                "rx_total=%s "
-                "fresh=%s/%s "
-                "stale=%s "
-                "resubscribed=%s "
-                "last_api_error=%s",
-                diag.get(
-                    "connected"
-                ),
-                diag.get(
-                    "tick_rx_total"
-                ),
-                fresh,
-                len(
-                    cfg.FOREX_PAIRS
-                ),
-                stale[:8],
-                requested[:8],
-                diag.get(
-                    "last_api_error"
-                ),
-            )
-
-            time.sleep(
-                max(
-                    5.0,
-                    interval,
-                )
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Tick health worker failed."
-            )
-
-            time.sleep(10.0)
-
-
-# ============================================================
-# BACKGROUND THREAD STARTUP
+# THREAD STARTUP
 # ============================================================
 
 def start_background_threads_once():
-
     global _threads_started
 
     with _threads_lock:
-
         if _threads_started:
             return
 
         _threads_started = True
 
-        workers = (
-            (
-                "DerivEngine",
-                run_engine,
-            ),
-            (
-                "ScanWorker",
-                run_scan_worker,
-            ),
-            (
-                "HistoryWorker",
-                run_history_worker,
-            ),
-            (
-                "OutcomeWorker",
-                run_outcome_worker,
-            ),
-            (
-                "TickHealthWorker",
-                run_tick_health_worker,
-            ),
-        )
+        threading.Thread(
+            target=engine_worker,
+            daemon=True,
+            name="PaperEngine",
+        ).start()
 
-        for (
-            name,
-            function,
-        ) in workers:
-
-            threading.Thread(
-                target=function,
-                daemon=True,
-                name=name,
-            ).start()
+        threading.Thread(
+            target=scanner_worker,
+            daemon=True,
+            name="PaperScanner",
+        ).start()
 
 
-@app.before_request
-def before_request_func():
-
-    # Safety net only.
-    # Workers normally already started
-    # when module loaded.
-    start_background_threads_once()
+start_background_threads_once()
 
 
 # ============================================================
-# WEB ROUTES
+# ROUTES
 # ============================================================
 
 @app.route("/")
 def dashboard():
-
-    return render_template(
-        "dashboard.html"
-    )
+    try:
+        return render_template(
+            "dashboard.html"
+        )
+    except Exception:
+        return (
+            "<h2>Offline Paper "
+            "Research Bot</h2>"
+            "<p>Use /health, "
+            "/api/evaluations or "
+            "/api/live-feed-diagnostics"
+            "</p>"
+        )
 
 
 @app.route("/health")
 def health():
-
     fresh = sum(
-        live_quote(symbol)
+        live_quote(
+            symbol
+        )
         is not None
         for symbol
         in cfg.FOREX_PAIRS
-    )
-
-    total = len(
-        cfg.FOREX_PAIRS
     )
 
     return jsonify(
@@ -2598,96 +802,30 @@ def health():
             "status":
                 (
                     "healthy"
-                    if (
-                        ready.is_set()
-                        and fresh == total
-                    )
-                    else "degraded"
-                ),
-            "deriv_connected":
-                bool(
-                    deriv_client
-                    .is_connected
-                ),
-            "engine_initialized":
-                ready.is_set(),
-            "fresh_pairs":
-                fresh,
-            "total_pairs":
-                total,
-            "signals_enabled":
-                cfg.SIGNALS_ENABLED,
-            "paper_mode":
-                bool(
-                    getattr(
-                        cfg,
-                        "PAPER_MODE",
-                        True,
-                    )
-                ),
-        }
-    )
-
-
-@app.route("/api/dashboard")
-def api_dashboard():
-
-    fresh = sum(
-        live_quote(symbol)
-        is not None
-        for symbol
-        in cfg.FOREX_PAIRS
-    )
-
-    is_connected = bool(
-        deriv_client.is_connected
-        and ready.is_set()
-        and fresh > 0
-    )
-
-    return jsonify(
-        {
-            "status":
-                (
-                    "online"
                     if ready.is_set()
                     else "starting"
                 ),
-            "connected":
-                is_connected,
-            "deriv_connected":
-                bool(
-                    deriv_client
-                    .is_connected
-                ),
-            "performance":
-                get_today_performance(),
-            "performance_basis":
-                (
-                    "hypothetical "
-                    "Deriv reference prices"
-                ),
-            "active_pairs":
-                list(
-                    cfg.FOREX_PAIRS.values()
-                ),
+            "mode":
+                "OFFLINE_SYNTHETIC",
             "paper_mode":
-                bool(
-                    getattr(
-                        cfg,
-                        "PAPER_MODE",
-                        True,
-                    )
+                True,
+            "fresh_symbols":
+                fresh,
+            "total_symbols":
+                len(
+                    cfg.FOREX_PAIRS
                 ),
+            "real_money_execution":
+                False,
         }
     )
 
 
-@app.route("/api/evaluations")
+@app.route(
+    "/api/evaluations"
+)
 def api_evaluations():
-
     with state_lock:
-
         return jsonify(
             dict(
                 latest_evaluations
@@ -2695,170 +833,54 @@ def api_evaluations():
         )
 
 
-def signal_rows(
-    active_only=False,
-):
-
-    conn = get_db_connection()
-
-    try:
-
-        query = """
-            SELECT
-                signal_id,
-                display_pair,
-                timeframe,
-                signal_timestamp_bdt,
-                direction,
-                score,
-                quality,
-                bias_15m,
-                entry_reference_price,
-                exit_reference_price,
-                result,
-                candle_epoch
-            FROM signal_history
-        """
-
-        if active_only:
-
-            query += (
-                " WHERE result = 'PENDING'"
+@app.route(
+    "/api/paper-signals"
+)
+def api_paper_signals():
+    with state_lock:
+        return jsonify(
+            list(
+                paper_signals
             )
-
-        query += (
-            " ORDER BY candle_epoch "
-            "DESC LIMIT 50"
         )
 
-        rows = conn.execute(
-            query
-        ).fetchall()
-
-    finally:
-
-        conn.close()
-
-    return [
-        {
-            "signal_id":
-                row[0],
-            "pair":
-                row[1],
-            "timeframe":
-                row[2],
-            "timestamp":
-                row[3],
-            "direction":
-                row[4],
-            "score":
-                row[5],
-            "quality":
-                row[6],
-            "bias":
-                row[7],
-            "price":
-                row[8],
-            "entry_price":
-                row[8],
-            "exit_price":
-                row[9],
-            "result":
-                row[10],
-            "target_candle_epoch":
-                row[11],
-            "performance_basis":
-                (
-                    "hypothetical "
-                    "Deriv reference prices"
-                ),
-        }
-        for row in rows
-    ]
-
-
-@app.route("/api/active-signals")
-@app.route("/api/signals/active")
-def api_active_signals():
-
-    return jsonify(
-        signal_rows(
-            active_only=True
-        )
-    )
-
-
-@app.route("/api/history")
-def api_history():
-
-    return jsonify(
-        signal_rows()
-    )
-
-
-@app.route("/api/performance")
-def api_performance():
-
-    return jsonify(
-        get_today_performance()
-    )
-
-
-@app.route("/api/pairs")
-def api_pairs():
-
-    return jsonify(
-        cfg.FOREX_PAIRS
-    )
-
-
-# ============================================================
-# LIVE FEED DIAGNOSTIC ENDPOINT
-# ============================================================
 
 @app.route(
     "/api/live-feed-diagnostics"
 )
 def api_live_feed_diagnostics():
-
-    client_diag = (
-        deriv_client
+    client = (
+        market_client
         .diagnostics()
     )
 
-    pairs = {}
+    output = {}
 
-    for symbol, display in (
-        cfg.FOREX_PAIRS.items()
-    ):
+    for (
+        symbol,
+        display,
+    ) in cfg.FOREX_PAIRS.items():
 
-        target = (
-            deriv_client
-            ._deriv_symbol(
+        clean = (
+            normalize_symbol(
                 symbol
             )
         )
 
-        pairs[display] = {
+        output[
+            display
+        ] = {
             "symbol":
-                symbol,
-            "deriv_symbol":
-                target,
-            "client":
-                client_diag
-                .get(
+                clean,
+            "feed":
+                client.get(
                     "symbols",
                     {},
-                )
-                .get(
-                    target,
+                ).get(
+                    clean,
                     {},
                 ),
-            "bot":
-                feed_diagnostics(
-                    symbol
-                ),
-            "live_quote_available":
+            "fresh_quote":
                 live_quote(
                     symbol
                 )
@@ -2867,227 +889,123 @@ def api_live_feed_diagnostics():
 
     return jsonify(
         {
-            "paper_mode":
-                bool(
-                    getattr(
-                        cfg,
-                        "PAPER_MODE",
-                        True,
-                    )
-                ),
+            "mode":
+                "OFFLINE_SYNTHETIC",
             "connected":
-                bool(
-                    deriv_client
-                    .is_connected
-                ),
+                market_client
+                .is_connected,
             "tick_rx_total":
-                client_diag.get(
+                client.get(
                     "tick_rx_total",
                     0,
                 ),
-            "last_api_error":
-                client_diag.get(
-                    "last_api_error",
-                    {},
-                ),
-            "pairs":
-                pairs,
-        }
-    )
-
-
-# ============================================================
-# HISTORY DIAGNOSTIC ENDPOINT
-# ============================================================
-
-@app.route(
-    "/api/history-diagnostics"
-)
-def api_history_diagnostics():
-
-    now = (
-        deriv_client
-        .get_server_time()
-    )
-
-    current_minute = (
-        int(now // 60)
-        * 60
-    )
-
-    expected_last = (
-        current_minute
-        - 60
-    )
-
-    output = {}
-
-    for symbol, display in (
-        cfg.FOREX_PAIRS.items()
-    ):
-
-        manager = (
-            candle_managers.get(
-                symbol
-            )
-        )
-
-        raw = (
-            history_snapshot(
-                symbol
-            )
-            if manager
-            else pd.DataFrame()
-        )
-
-        filtered = (
-            raw[
-                raw["time"]
-                <= expected_last
-            ].reset_index(
-                drop=True
-            )
-            if (
-                not raw.empty
-                and "time"
-                in raw.columns
-            )
-            else raw
-        )
-
-        prepared = (
-            prepare_history(
-                filtered
-            )
-            if not filtered.empty
-            else filtered
-        )
-
-        output[display] = {
-            "symbol":
-                symbol,
-            "expected_last_epoch":
-                expected_last,
-            "manager_1m":
-                (
-                    manager.diagnostics(
-                        "1M"
-                    )
-                    if manager
-                    else {}
-                ),
-            "manager_5m":
-                (
-                    manager.diagnostics(
-                        "5M"
-                    )
-                    if manager
-                    else {}
-                ),
-            "raw_count_before_prepare":
-                (
-                    int(
-                        len(
-                            filtered
-                        )
-                    )
-                    if filtered
-                    is not None
-                    else 0
-                ),
-            "prepared_count":
-                (
-                    int(
-                        len(
-                            prepared
-                        )
-                    )
-                    if prepared
-                    is not None
-                    else 0
-                ),
-            "prepared_last_epoch":
-                (
-                    int(
-                        prepared
-                        .iloc[-1][
-                            "time"
-                        ]
-                    )
-                    if (
-                        prepared
-                        is not None
-                        and not prepared.empty
-                        and "time"
-                        in prepared.columns
-                    )
-                    else None
-                ),
-            "latest_candle_exact":
-                bool(
-                    prepared
-                    is not None
-                    and not prepared.empty
-                    and "time"
-                    in prepared.columns
-                    and int(
-                        prepared
-                        .iloc[-1][
-                            "time"
-                        ]
-                    )
-                    == expected_last
-                ),
-        }
-
-    return jsonify(
-        {
-            "server_epoch":
-                now,
-            "current_minute_epoch":
-                current_minute,
-            "expected_last_closed_epoch":
-                expected_last,
             "pairs":
                 output,
         }
     )
 
 
+@app.route(
+    "/api/history-diagnostics"
+)
+def api_history_diagnostics():
+    data = {}
+
+    for (
+        symbol,
+        display,
+    ) in cfg.FOREX_PAIRS.items():
+
+        df_1m = history_snapshot(
+            symbol,
+            "1M",
+        )
+
+        df_5m = history_snapshot(
+            symbol,
+            "5M",
+        )
+
+        data[
+            display
+        ] = {
+            "1m_count":
+                int(
+                    len(
+                        df_1m
+                    )
+                ),
+            "1m_last_epoch":
+                (
+                    int(
+                        df_1m
+                        .iloc[-1][
+                            "time"
+                        ]
+                    )
+                    if (
+                        not df_1m.empty
+                        and "time"
+                        in df_1m.columns
+                    )
+                    else None
+                ),
+            "5m_count":
+                int(
+                    len(
+                        df_5m
+                    )
+                ),
+        }
+
+    return jsonify(
+        {
+            "mode":
+                "OFFLINE_SYNTHETIC",
+            "pairs":
+                data,
+        }
+    )
+
+
+@app.route(
+    "/api/dashboard"
+)
+def api_dashboard():
+    return jsonify(
+        {
+            "status":
+                (
+                    "online"
+                    if ready.is_set()
+                    else "starting"
+                ),
+            "mode":
+                "OFFLINE_SYNTHETIC",
+            "paper_mode":
+                True,
+            "real_money_execution":
+                False,
+            "signals_recorded":
+                len(
+                    paper_signals
+                ),
+        }
+    )
+
+
+@app.route("/api/pairs")
+def api_pairs():
+    return jsonify(
+        cfg.FOREX_PAIRS
+    )
+
+
 # ============================================================
-# START BACKGROUND WORKERS
-# ============================================================
-
-# Start engine, scanner, history refresh,
-# outcome tracking and tick diagnostics
-# as soon as Gunicorn imports bot.py.
-#
-# IMPORTANT:
-# Keep Gunicorn at ONE worker process.
-#
-# Multiple Gunicorn workers would create
-# independent copies of:
-# - scanner threads
-# - WebSocket connections
-# - candle state
-# - tick state
-#
-# Recommended Render Start Command:
-#
-# gunicorn --workers 1 --threads 8 --timeout 120 \
-# --bind 0.0.0.0:$PORT bot:app
-
-start_background_threads_once()
-
-
-# ============================================================
-# LOCAL RUN
+# LOCAL
 # ============================================================
 
 if __name__ == "__main__":
-
-    start_background_threads_once()
-
     app.run(
         host="0.0.0.0",
         port=int(

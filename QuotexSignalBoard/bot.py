@@ -43,7 +43,7 @@ logger = logging.getLogger(
 
 
 # ============================================================
-# FLASK
+# FLASK APP
 # ============================================================
 
 app = Flask(__name__)
@@ -53,13 +53,9 @@ app = Flask(__name__)
 # SHARED STATE
 # ============================================================
 
-event_dispatcher = (
-    EventDispatcher()
-)
+event_dispatcher = EventDispatcher()
 
-market_client = (
-    DerivClient()
-)
+market_client = DerivClient()
 
 candle_managers = {}
 
@@ -115,9 +111,7 @@ def create_tick_handler(
             price = float(price)
 
             if (
-                not math.isfinite(
-                    price
-                )
+                not math.isfinite(price)
                 or price <= 0
             ):
                 return
@@ -157,6 +151,7 @@ def create_tick_handler(
 # ============================================================
 
 for symbol in cfg.FOREX_PAIRS:
+
     manager = CandleManager(
         symbol=symbol,
         event_dispatcher=(
@@ -187,11 +182,13 @@ for symbol in cfg.FOREX_PAIRS:
 # ============================================================
 
 def live_quote(symbol):
+
     clean = normalize_symbol(
         symbol
     )
 
     with state_lock:
+
         row = live_state.get(
             clean
         )
@@ -236,6 +233,7 @@ def history_snapshot(
     symbol,
     timeframe="1M",
 ):
+
     manager = (
         candle_managers.get(
             symbol
@@ -259,11 +257,13 @@ def history_snapshot(
 
 
 def seed_history():
+
     jobs = []
 
     for symbol in (
         cfg.FOREX_PAIRS
     ):
+
         jobs.append(
             {
                 "key":
@@ -298,6 +298,7 @@ def seed_history():
     for symbol, manager in (
         candle_managers.items()
     ):
+
         raw = histories.get(
             symbol,
             [],
@@ -307,6 +308,7 @@ def seed_history():
             continue
 
         try:
+
             manager.seed_historical_candles(
                 "1M",
                 raw,
@@ -333,18 +335,20 @@ def seed_history():
 
 
 # ============================================================
-# PAPER SIGNAL RECORDING
+# PAPER SIGNAL
 # ============================================================
 
 def record_paper_signal(
     candidate,
     target_epoch,
 ):
+
     quote = live_quote(
         candidate["symbol"]
     )
 
     if quote is None:
+
         logger.warning(
             "PAPER_SIGNAL skipped "
             "%s: no current "
@@ -352,9 +356,14 @@ def record_paper_signal(
             candidate["symbol"],
         )
 
-        return
+        return None
 
     item = {
+        "signal_id":
+            (
+                f"{candidate['symbol']}"
+                f"_{int(target_epoch)}"
+            ),
         "timestamp":
             int(
                 time.time()
@@ -371,6 +380,12 @@ def record_paper_signal(
             candidate[
                 "display_name"
             ],
+        "display_pair":
+            candidate[
+                "display_name"
+            ],
+        "timeframe":
+            "1M",
         "direction":
             candidate[
                 "direction"
@@ -384,12 +399,34 @@ def record_paper_signal(
                 "quality"
             ],
         "entry_reference":
-            quote["price"],
+            quote[
+                "price"
+            ],
+        "entry_price":
+            quote[
+                "price"
+            ],
+        "exit_price":
+            None,
+        "result":
+            "PENDING",
         "mode":
             "PAPER_SYNTHETIC",
     }
 
     with state_lock:
+
+        # Prevent duplicate signal
+        # for same pair/minute.
+        duplicate = any(
+            x.get("signal_id")
+            == item["signal_id"]
+            for x in paper_signals
+        )
+
+        if duplicate:
+            return None
+
         paper_signals.insert(
             0,
             item,
@@ -415,6 +452,126 @@ def record_paper_signal(
         quote["price"],
     )
 
+    return item
+
+
+# ============================================================
+# PAPER OUTCOME
+# ============================================================
+
+def update_paper_outcomes():
+
+    with state_lock:
+        pending = [
+            dict(item)
+            for item in paper_signals
+            if item.get(
+                "result"
+            ) == "PENDING"
+        ]
+
+    now = int(
+        time.time()
+    )
+
+    for item in pending:
+
+        target_epoch = int(
+            item[
+                "target_epoch"
+            ]
+        )
+
+        # Wait until target 1M candle
+        # is expected to be closed.
+        if now < (
+            target_epoch
+            + 60
+        ):
+            continue
+
+        symbol = item[
+            "symbol"
+        ]
+
+        df = history_snapshot(
+            symbol,
+            "1M",
+        )
+
+        if (
+            df.empty
+            or "time"
+            not in df.columns
+        ):
+            continue
+
+        match = df[
+            df["time"]
+            == target_epoch
+        ]
+
+        if match.empty:
+            continue
+
+        exit_price = float(
+            match.iloc[-1][
+                "close"
+            ]
+        )
+
+        entry_price = float(
+            item[
+                "entry_price"
+            ]
+        )
+
+        direction = item[
+            "direction"
+        ]
+
+        difference = (
+            exit_price
+            - entry_price
+        )
+
+        if direction == "PUT":
+            difference = (
+                -difference
+            )
+
+        if difference > 0:
+            result = "WIN"
+
+        elif difference < 0:
+            result = "LOSS"
+
+        else:
+            result = "TIE"
+
+        with state_lock:
+
+            for stored in paper_signals:
+
+                if (
+                    stored.get(
+                        "signal_id"
+                    )
+                    == item.get(
+                        "signal_id"
+                    )
+                ):
+
+                    stored[
+                        "exit_price"
+                    ] = exit_price
+
+                    stored[
+                        "result"
+                    ] = result
+
+                    break
+
 
 # ============================================================
 # STRATEGY EVALUATION
@@ -423,6 +580,7 @@ def record_paper_signal(
 def evaluate_all(
     target_epoch,
 ):
+
     reports = {}
 
     candidates = []
@@ -453,6 +611,7 @@ def evaluate_all(
         }
 
         try:
+
             raw = history_snapshot(
                 symbol,
                 "1M",
@@ -463,6 +622,7 @@ def evaluate_all(
                 or "time"
                 not in raw.columns
             ):
+
                 report[
                     "reason"
                 ] = "NO_HISTORY"
@@ -488,13 +648,16 @@ def evaluate_all(
 
             if (
                 prepared.empty
-                or len(prepared)
+                or len(
+                    prepared
+                )
                 < getattr(
                     cfg,
                     "MIN_1M_HISTORY",
                     20,
                 )
             ):
+
                 report[
                     "reason"
                 ] = (
@@ -517,6 +680,7 @@ def evaluate_all(
                 latest_epoch
                 != expected_last
             ):
+
                 report[
                     "reason"
                 ] = (
@@ -530,11 +694,9 @@ def evaluate_all(
 
                 continue
 
-            df_5m = (
-                history_snapshot(
-                    symbol,
-                    "5M",
-                )
+            df_5m = history_snapshot(
+                symbol,
+                "5M",
             )
 
             (
@@ -589,6 +751,7 @@ def evaluate_all(
                 "CALL",
                 "PUT",
             ):
+
                 candidates.append(
                     {
                         "symbol":
@@ -607,6 +770,7 @@ def evaluate_all(
                 )
 
         except Exception as exc:
+
             report[
                 "reason"
             ] = (
@@ -632,6 +796,7 @@ def evaluate_all(
     )
 
     with state_lock:
+
         latest_evaluations.clear()
 
         latest_evaluations.update(
@@ -647,6 +812,7 @@ def evaluate_all(
     )
 
     if candidates:
+
         record_paper_signal(
             candidates[0],
             target_epoch,
@@ -654,16 +820,19 @@ def evaluate_all(
 
 
 # ============================================================
-# SCANNER
+# SCANNER WORKER
 # ============================================================
 
 def scanner_worker():
+
     ready.wait()
 
     last_minute = None
 
     while True:
+
         try:
+
             now = int(
                 time.time()
             )
@@ -673,7 +842,8 @@ def scanner_worker():
             ) * 60
 
             seconds = (
-                now - minute
+                now
+                - minute
             )
 
             if (
@@ -686,6 +856,7 @@ def scanner_worker():
                     2,
                 )
             ):
+
                 evaluate_all(
                     minute
                 )
@@ -699,6 +870,7 @@ def scanner_worker():
             )
 
         except Exception:
+
             logger.exception(
                 "Paper scanner failed."
             )
@@ -709,27 +881,53 @@ def scanner_worker():
 
 
 # ============================================================
+# PAPER OUTCOME WORKER
+# ============================================================
+
+def outcome_worker():
+
+    ready.wait()
+
+    while True:
+
+        try:
+
+            update_paper_outcomes()
+
+        except Exception:
+
+            logger.exception(
+                "Paper outcome worker "
+                "failed."
+            )
+
+        time.sleep(
+            5
+        )
+
+
+# ============================================================
 # ENGINE
 # ============================================================
 
 def engine_worker():
+
     try:
-        # Seed historical data first.
+
         seed_history()
 
-        # Start synthetic live ticks.
         market_client.start()
 
         ready.set()
 
         logger.info(
-            "OFFLINE PAPER ENGINE "
-            "READY. "
-            "No external market "
-            "service is connected."
+            "OFFLINE PAPER ENGINE READY. "
+            "No external market service "
+            "is connected."
         )
 
     except Exception:
+
         logger.exception(
             "Paper engine startup "
             "failed."
@@ -741,53 +939,78 @@ def engine_worker():
 # ============================================================
 
 def start_background_threads_once():
+
     global _threads_started
 
     with _threads_lock:
+
         if _threads_started:
             return
 
         _threads_started = True
 
-        threading.Thread(
-            target=engine_worker,
-            daemon=True,
-            name="PaperEngine",
-        ).start()
+        workers = (
+            (
+                "PaperEngine",
+                engine_worker,
+            ),
+            (
+                "PaperScanner",
+                scanner_worker,
+            ),
+            (
+                "PaperOutcome",
+                outcome_worker,
+            ),
+        )
 
-        threading.Thread(
-            target=scanner_worker,
-            daemon=True,
-            name="PaperScanner",
-        ).start()
+        for (
+            name,
+            function,
+        ) in workers:
+
+            threading.Thread(
+                target=function,
+                daemon=True,
+                name=name,
+            ).start()
 
 
 start_background_threads_once()
 
 
 # ============================================================
-# ROUTES
+# DASHBOARD
 # ============================================================
 
 @app.route("/")
 def dashboard():
+
     try:
+
         return render_template(
             "dashboard.html"
         )
+
     except Exception:
+
         return (
-            "<h2>Offline Paper "
-            "Research Bot</h2>"
+            "<h2>Offline Paper Research Bot</h2>"
+            "<p>Mode: OFFLINE_SYNTHETIC</p>"
             "<p>Use /health, "
-            "/api/evaluations or "
-            "/api/live-feed-diagnostics"
-            "</p>"
+            "/api/evaluations, "
+            "/api/paper-signals, "
+            "/api/live-feed-diagnostics</p>"
         )
 
 
+# ============================================================
+# HEALTH
+# ============================================================
+
 @app.route("/health")
 def health():
+
     fresh = sum(
         live_quote(
             symbol
@@ -821,11 +1044,17 @@ def health():
     )
 
 
+# ============================================================
+# EVALUATIONS
+# ============================================================
+
 @app.route(
     "/api/evaluations"
 )
 def api_evaluations():
+
     with state_lock:
+
         return jsonify(
             dict(
                 latest_evaluations
@@ -833,11 +1062,17 @@ def api_evaluations():
         )
 
 
+# ============================================================
+# PAPER SIGNALS
+# ============================================================
+
 @app.route(
     "/api/paper-signals"
 )
 def api_paper_signals():
+
     with state_lock:
+
         return jsonify(
             list(
                 paper_signals
@@ -845,10 +1080,155 @@ def api_paper_signals():
         )
 
 
+# ============================================================
+# OLD DASHBOARD COMPATIBILITY ROUTES
+# ============================================================
+
+@app.route(
+    "/api/active-signals"
+)
+@app.route(
+    "/api/signals/active"
+)
+def api_active_signals():
+
+    with state_lock:
+
+        active = [
+            dict(item)
+            for item in paper_signals
+            if item.get(
+                "result"
+            ) == "PENDING"
+        ]
+
+    return jsonify(
+        active
+    )
+
+
+@app.route(
+    "/api/history"
+)
+def api_history():
+
+    with state_lock:
+
+        history = [
+            dict(item)
+            for item
+            in paper_signals
+        ]
+
+    return jsonify(
+        history
+    )
+
+
+@app.route(
+    "/api/performance"
+)
+def api_performance():
+
+    with state_lock:
+
+        signals = [
+            dict(item)
+            for item
+            in paper_signals
+        ]
+
+    wins = sum(
+        1
+        for item in signals
+        if item.get(
+            "result"
+        ) == "WIN"
+    )
+
+    losses = sum(
+        1
+        for item in signals
+        if item.get(
+            "result"
+        ) == "LOSS"
+    )
+
+    ties = sum(
+        1
+        for item in signals
+        if item.get(
+            "result"
+        ) == "TIE"
+    )
+
+    pending = sum(
+        1
+        for item in signals
+        if item.get(
+            "result"
+        ) == "PENDING"
+    )
+
+    completed = (
+        wins
+        + losses
+    )
+
+    win_rate = (
+        round(
+            (
+                wins
+                / completed
+                * 100.0
+            ),
+            2,
+        )
+        if completed > 0
+        else 0.0
+    )
+
+    return jsonify(
+        {
+            "total_signals":
+                len(
+                    signals
+                ),
+            "wins":
+                wins,
+            "losses":
+                losses,
+            "ties":
+                ties,
+            "pending":
+                pending,
+            "win_rate":
+                win_rate,
+            "mode":
+                "OFFLINE_SYNTHETIC",
+            "paper_mode":
+                True,
+            "real_money_execution":
+                False,
+            "note":
+                (
+                    "Synthetic paper mode "
+                    "only. Results are not "
+                    "real-market performance."
+                ),
+        }
+    )
+
+
+# ============================================================
+# LIVE FEED DIAGNOSTICS
+# ============================================================
+
 @app.route(
     "/api/live-feed-diagnostics"
 )
 def api_live_feed_diagnostics():
+
     client = (
         market_client
         .diagnostics()
@@ -905,10 +1285,15 @@ def api_live_feed_diagnostics():
     )
 
 
+# ============================================================
+# HISTORY DIAGNOSTICS
+# ============================================================
+
 @app.route(
     "/api/history-diagnostics"
 )
 def api_history_diagnostics():
+
     data = {}
 
     for (
@@ -968,10 +1353,38 @@ def api_history_diagnostics():
     )
 
 
+# ============================================================
+# DASHBOARD API
+# ============================================================
+
 @app.route(
     "/api/dashboard"
 )
 def api_dashboard():
+
+    fresh = sum(
+        live_quote(
+            symbol
+        )
+        is not None
+        for symbol
+        in cfg.FOREX_PAIRS
+    )
+
+    with state_lock:
+
+        total_signals = len(
+            paper_signals
+        )
+
+        pending = sum(
+            1
+            for item in paper_signals
+            if item.get(
+                "result"
+            ) == "PENDING"
+        )
+
     return jsonify(
         {
             "status":
@@ -980,32 +1393,51 @@ def api_dashboard():
                     if ready.is_set()
                     else "starting"
                 ),
+            "connected":
+                (
+                    ready.is_set()
+                    and fresh > 0
+                ),
             "mode":
                 "OFFLINE_SYNTHETIC",
             "paper_mode":
                 True,
             "real_money_execution":
                 False,
-            "signals_recorded":
+            "fresh_symbols":
+                fresh,
+            "total_symbols":
                 len(
-                    paper_signals
+                    cfg.FOREX_PAIRS
                 ),
+            "signals_recorded":
+                total_signals,
+            "active_signals":
+                pending,
         }
     )
 
 
-@app.route("/api/pairs")
+# ============================================================
+# PAIRS
+# ============================================================
+
+@app.route(
+    "/api/pairs"
+)
 def api_pairs():
+
     return jsonify(
         cfg.FOREX_PAIRS
     )
 
 
 # ============================================================
-# LOCAL
+# START LOCAL SERVER
 # ============================================================
 
 if __name__ == "__main__":
+
     app.run(
         host="0.0.0.0",
         port=int(

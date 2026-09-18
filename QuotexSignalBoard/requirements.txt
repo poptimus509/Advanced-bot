@@ -1,8 +1,0 @@
-flask
-gunicorn
-websocket-client
-pandas
-numpy
-requests
-pusher
-pytz

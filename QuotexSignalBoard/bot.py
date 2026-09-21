@@ -274,18 +274,6 @@ for symbol in cfg.FOREX_PAIRS:
 
 
 def live_quote(symbol):
-    """
-    Returns the most recent trustworthy price for `symbol`, or None if
-    nothing recent enough exists.
-
-    Previously this accepted a live tick of any age, and separately would
-    fall back to a >120-second-old closed candle close as if it were a
-    live quote. Both paths could hand back a stale price silently -
-    which matters a lot for entry_reference_price, since a bot claiming
-    a specific entry price should not be quietly using data from two
-    minutes ago. Now anything older than cfg.STALE_TICK_THRESHOLD_SEC is
-    rejected outright rather than papered over.
-    """
     variants = get_symbol_variants(symbol)
     stale_after = getattr(cfg, "STALE_TICK_THRESHOLD_SEC", 25.0)
 
@@ -320,8 +308,6 @@ def live_quote(symbol):
 
 def history_snapshot(symbol, timeframe="1M"):
     if timeframe != "1M":
-        # 5M/15M candles carry no live tick-verification window; just
-        # hand back the closed history as CandleManager built it.
         manager = candle_managers.get(symbol)
         if not manager:
             return pd.DataFrame()
@@ -413,10 +399,6 @@ def send_telegram_alert(candidate, target_epoch):
         else "📈 5M Trend: not available (skipped - insufficient 5M history)\n"
     )
 
-    # This bot analyzes the Deriv (frx) feed. Quotex, especially its OTC
-    # instruments, generates its own candles that can and do diverge from
-    # Deriv's. Every message says so explicitly instead of implying the
-    # analysis is on the exact feed being traded.
     message = (
         "⚡️ MARKET ANALYSIS SIGNAL ⚡️\n\n"
         f"📊 Pair: {candidate['display_name']}\n"
@@ -505,11 +487,6 @@ def dispatch_best_signal(candidate, target_epoch):
         try:
             save_signal(candidate, target_epoch, quote["price"])
         except Exception:
-            # A Telegram message already went out, but the DB record
-            # failed - this used to fail silently, meaning the signal
-            # was invisible to /api/history and win-rate stats forever.
-            # It's still not retried here (that's a bigger change), but
-            # it is now at least logged so the gap is diagnosable.
             logger.exception(
                 "save_signal failed after SENT Telegram alert for %s %s",
                 candidate["symbol"], candidate["direction"],
@@ -577,10 +554,6 @@ def evaluate_and_dispatch_all(target_epoch):
                     reports[display] = report
                     continue
 
-                # Real 5M regime + ADX context. If either is unavailable
-                # or too short, evaluate_strategy's own defensive checks
-                # skip the corresponding gate rather than guessing - this
-                # never raises and never blocks the 1M-only evaluation.
                 df_5m = history_snapshot(symbol, "5M")
                 adx_5m = None
                 min_5m = getattr(cfg, "CONTEXT_5M_MIN_CANDLES", 10)
@@ -756,13 +729,6 @@ def run_scan_worker():
                 time.sleep(0.5)
                 continue
 
-            # A signal dispatched at, say, second 40 of the minute is
-            # entering ~40 seconds into that candle's move, not at its
-            # open - yet the recorded entry_reference_price and the
-            # Telegram message both implicitly assume a fresh entry. The
-            # previous window (up to second 45) allowed exactly that.
-            # Keeping the window tight to the start of the minute keeps
-            # "entry price" honest relative to what was actually analyzed.
             scan_delay = getattr(cfg, "SCAN_DELAY_SECONDS", 2.0)
             max_delay = getattr(cfg, "MAX_ENTRY_DELAY_SECONDS", 10.0)
 
@@ -822,10 +788,6 @@ def run_engine():
 # ============================================================
 
 def _prune_dispatch_ledger(older_than_seconds: int = 86400):
-    # dispatch_ledger_v2 previously grew forever - one row per (symbol,
-    # target_epoch) attempted, indefinitely. It only needs to remember
-    # enough history to prevent same-minute duplicate dispatch, so a
-    # rolling 24h window is more than sufficient.
     conn = get_db_connection()
     try:
         cutoff = int(time.time()) - older_than_seconds
@@ -925,10 +887,6 @@ def start_background_threads_once():
 
 @app.before_request
 def before_request_func():
-    # Kept as a safety net (in case the process-start call below ever
-    # fails to run for some reason), but this should already be a no-op
-    # in normal operation - see start_background_threads_once() call at
-    # module load time, right after the Flask app and routes are wired.
     start_background_threads_once()
 
 
@@ -936,12 +894,17 @@ def before_request_func():
 # WEB ROUTES
 # ============================================================
 
-@app.route("/")
+@app.route("/", methods=["GET", "HEAD"])
 def dashboard():
     return render_template("dashboard.html")
 
 
-@app.route("/health")
+@app.route("/ping", methods=["GET", "HEAD"])
+def ping():
+    return "pong", 200
+
+
+@app.route("/health", methods=["GET", "HEAD"])
 def health():
     fresh = sum(live_quote(symbol) is not None for symbol in cfg.FOREX_PAIRS)
     total = len(cfg.FOREX_PAIRS)
@@ -956,7 +919,7 @@ def health():
     })
 
 
-@app.route("/api/dashboard")
+@app.route("/api/dashboard", methods=["GET", "HEAD"])
 def api_dashboard():
     fresh = sum(live_quote(symbol) is not None for symbol in cfg.FOREX_PAIRS)
     is_connected = bool(deriv_client.is_connected and ready.is_set() and fresh > 0)
@@ -971,7 +934,7 @@ def api_dashboard():
     })
 
 
-@app.route("/api/evaluations")
+@app.route("/api/evaluations", methods=["GET", "HEAD"])
 def api_evaluations():
     with state_lock:
         return jsonify(dict(latest_evaluations))
@@ -1014,48 +977,27 @@ def signal_rows(active_only=False):
     ]
 
 
-@app.route("/api/active-signals")
-@app.route("/api/signals/active")
+@app.route("/api/active-signals", methods=["GET", "HEAD"])
+@app.route("/api/signals/active", methods=["GET", "HEAD"])
 def api_active_signals():
     return jsonify(signal_rows(active_only=True))
 
 
-@app.route("/api/history")
+@app.route("/api/history", methods=["GET", "HEAD"])
 def api_history():
     return jsonify(signal_rows())
 
 
-@app.route("/api/performance")
+@app.route("/api/performance", methods=["GET", "HEAD"])
 def api_performance():
     return jsonify(get_today_performance())
 
 
-@app.route("/api/pairs")
+@app.route("/api/pairs", methods=["GET", "HEAD"])
 def api_pairs():
     return jsonify(cfg.FOREX_PAIRS)
 
 
-# Start the worker threads (Deriv engine, scan/telegram, history resync,
-# outcome tracking) as soon as the module is loaded - not on the first
-# incoming HTTP request. The previous version only started them inside
-# @app.before_request, which meant:
-#   1. A deployed process with no traffic yet never scanned or sent
-#      any signal, silently, until someone hit the URL.
-#   2. Render/most PaaS health checks hit "/" or "/health" almost
-#      immediately, which made this look like it worked in testing,
-#      while still being fragile.
-# start_background_threads_once() is idempotent (guarded by
-# _threads_started + a lock), so this is safe even though
-# @app.before_request above still also calls it as a fallback.
-#
-# IMPORTANT - this does NOT make it safe to run with multiple gunicorn
-# worker processes. Each worker process is a separate Python process
-# with its own copy of these threads, in-memory candle state, and
-# dispatch dedup set, so N workers means N independent scanners each
-# capable of sending its own Telegram message for the same signal.
-# Deploy with a single worker (see the Render start command in
-# CORRECTIONS.md) until the scan/dispatch logic is moved to a separate
-# always-single-instance process.
 start_background_threads_once()
 
 

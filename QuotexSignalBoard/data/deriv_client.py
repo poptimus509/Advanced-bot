@@ -3,6 +3,7 @@ import logging
 import websocket
 import threading
 import time
+import ssl
 from typing import Dict, List, Any, Optional
 import config as cfg
 
@@ -70,7 +71,7 @@ class DerivClient:
 
             try:
                 self.ws.send(json.dumps(req))
-                if event.wait(timeout=3.0):
+                if event.wait(timeout=4.0):
                     candles = self._request_results.pop(req_id, [])
                     if candles:
                         results[key] = candles
@@ -102,7 +103,7 @@ class DerivClient:
         }
         try:
             self.ws.send(json.dumps(req))
-            if event.wait(timeout=3.0):
+            if event.wait(timeout=4.0):
                 return self._request_results.pop(req_id, [])
         except Exception:
             pass
@@ -121,8 +122,15 @@ class DerivClient:
 
     def connect(self):
         app_id = getattr(cfg, "APP_ID", 1089)
-        url = f"wss://ws.derivws.com/websockets/v3?app_id={app_id}"
+        url = f"wss://frontend.binaryws.com/websockets/v3?app_id={app_id}"
         self.is_running = True
+
+        custom_headers = [
+            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Origin: https://deriv.com",
+            "Accept-Language: en-US,en;q=0.9",
+            "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits"
+        ]
 
         def run():
             while self.is_running:
@@ -130,18 +138,24 @@ class DerivClient:
                     logger.info("Connecting to Deriv WebSocket API...")
                     self.ws = websocket.WebSocketApp(
                         url,
+                        header=custom_headers,
                         on_open=self.on_open,
                         on_message=self.on_message,
                         on_error=self.on_error,
                         on_close=self.on_close
                     )
-                    self.ws.run_forever(ping_interval=20, ping_timeout=10)
+                    self.ws.run_forever(
+                        ping_interval=20,
+                        ping_timeout=10,
+                        sslopt={"cert_reqs": ssl.CERT_NONE},
+                        origin="https://deriv.com"
+                    )
                 except Exception as e:
                     logger.error(f"Deriv WebSocket connection error: {e}")
 
                 self.connected = False
                 if self.is_running:
-                    time.sleep(5)
+                    time.sleep(12)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -159,7 +173,6 @@ class DerivClient:
         self.subscribe_symbols(ws)
 
     def subscribe_symbols(self, ws):
-        # Merge symbols from both FOREX_PAIRS and ACTIVE_SYMBOLS
         pairs_to_sub = set()
         if hasattr(cfg, "FOREX_PAIRS") and isinstance(cfg.FOREX_PAIRS, dict):
             pairs_to_sub.update(cfg.FOREX_PAIRS.keys())
@@ -169,18 +182,13 @@ class DerivClient:
         logger.info(f"DerivClient: Subscribing to live ticks for {len(pairs_to_sub)} pairs.")
         for symbol in pairs_to_sub:
             clean = symbol.replace("frx", "").replace("/", "").upper()
-            # Only the "frx"-prefixed form is a valid Deriv symbol.
-            # Subscribing to the bare form too (e.g. "EURUSD" without
-            # "frx") used to send one guaranteed-invalid request per
-            # pair on every connect, generating error spam for no
-            # benefit - ticks were only ever routed via the frx symbol.
             target_sym = f"frx{clean}"
             req = {"ticks": target_sym, "subscribe": 1}
             try:
                 ws.send(json.dumps(req))
             except Exception:
                 logger.exception("Failed to subscribe to %s", target_sym)
-            time.sleep(0.04)
+            time.sleep(0.05)
 
     def on_message(self, ws, message):
         try:
@@ -198,7 +206,6 @@ class DerivClient:
                     self.server_time = epoch
                     clean = symbol.replace("frx", "").replace("/", "").upper()
 
-                    # Find corresponding handler
                     handler = (
                         self.tick_handlers.get(symbol)
                         or self.tick_handlers.get(clean)

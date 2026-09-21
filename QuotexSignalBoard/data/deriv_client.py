@@ -3,7 +3,6 @@ import logging
 import websocket
 import threading
 import time
-import ssl
 from typing import Dict, List, Any, Optional
 import config as cfg
 
@@ -120,17 +119,10 @@ class DerivClient:
         self.connect()
 
     def connect(self):
-        app_id = getattr(cfg, "APP_ID", 1089)
-        # Using binaryws endpoint directly
-        url = f"wss://frontend.binaryws.com/websockets/v3?app_id={app_id}&l=en&brand=deriv"
+        # This client only reads public ticks and candle history. The current
+        # public API needs neither an app_id nor legacy authorize messages.
+        url = "wss://api.derivws.com/trading/v1/options/ws/public"
         self.is_running = True
-
-        custom_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            "Origin": "https://deriv.com",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Accept-Language": "en-US,en;q=0.9"
-        }
 
         def run():
             while self.is_running:
@@ -138,7 +130,6 @@ class DerivClient:
                     logger.info("Connecting to Deriv WebSocket API...")
                     self.ws = websocket.WebSocketApp(
                         url,
-                        header=custom_headers,
                         on_open=self.on_open,
                         on_message=self.on_message,
                         on_error=self.on_error,
@@ -147,10 +138,9 @@ class DerivClient:
                     self.ws.run_forever(
                         ping_interval=25,
                         ping_timeout=10,
-                        sslopt={
-                            "cert_reqs": ssl.CERT_NONE,
-                            "check_hostname": False
-                        }
+                        # Let websocket-client emit exactly one Origin header.
+                        # Default TLS certificate and hostname checks stay enabled.
+                        origin="https://deriv.com",
                     )
                 except Exception as e:
                     logger.error(f"Deriv WebSocket connection error: {e}")
@@ -164,14 +154,6 @@ class DerivClient:
     def on_open(self, ws):
         logger.info("Connected to Deriv API successfully.")
         self.connected = True
-        api_token = getattr(cfg, "API_TOKEN", None)
-        if api_token:
-            auth_req = {"authorize": api_token}
-            try:
-                ws.send(json.dumps(auth_req))
-            except Exception:
-                pass
-
         self.subscribe_symbols(ws)
 
     def subscribe_symbols(self, ws):
@@ -197,6 +179,18 @@ class DerivClient:
             data = json.loads(message)
             msg_type = data.get("msg_type")
             req_id = data.get("req_id")
+
+            # Deriv errors retain the request's msg_type (e.g. candles or tick).
+            # Check the error payload before dispatching by message type.
+            if data.get("error"):
+                error = data["error"]
+                logger.warning("Deriv API error (%s): %s",
+                               error.get("code", "unknown"),
+                               error.get("message", "Unknown error"))
+                if req_id is not None and req_id in self._pending_requests:
+                    self._request_results[req_id] = []
+                    self._pending_requests[req_id].set()
+                return
 
             if msg_type == "tick":
                 tick = data.get("tick")
@@ -253,6 +247,7 @@ class DerivClient:
 
     def on_error(self, ws, error):
         self.connected = False
+        logger.error("Deriv WebSocket error: %s", error)
 
     def on_close(self, ws, close_status_code, close_msg):
         self.connected = False

@@ -20,7 +20,6 @@ class DerivClient:
         self.connected = False
         self.tick_handlers = {}
         
-        # Concurrency & request tracking
         self._req_id_counter = 0
         self._req_lock = threading.Lock()
         self._pending_requests: Dict[int, threading.Event] = {}
@@ -122,15 +121,16 @@ class DerivClient:
 
     def connect(self):
         app_id = getattr(cfg, "APP_ID", 1089)
-        url = f"wss://frontend.binaryws.com/websockets/v3?app_id={app_id}"
+        # Using binaryws endpoint directly
+        url = f"wss://frontend.binaryws.com/websockets/v3?app_id={app_id}&l=en&brand=deriv"
         self.is_running = True
 
-        custom_headers = [
-            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Origin: https://deriv.com",
-            "Accept-Language: en-US,en;q=0.9",
-            "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits"
-        ]
+        custom_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "Origin": "https://deriv.com",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Language": "en-US,en;q=0.9"
+        }
 
         def run():
             while self.is_running:
@@ -145,17 +145,19 @@ class DerivClient:
                         on_close=self.on_close
                     )
                     self.ws.run_forever(
-                        ping_interval=20,
+                        ping_interval=25,
                         ping_timeout=10,
-                        sslopt={"cert_reqs": ssl.CERT_NONE},
-                        origin="https://deriv.com"
+                        sslopt={
+                            "cert_reqs": ssl.CERT_NONE,
+                            "check_hostname": False
+                        }
                     )
                 except Exception as e:
                     logger.error(f"Deriv WebSocket connection error: {e}")
 
                 self.connected = False
                 if self.is_running:
-                    time.sleep(12)
+                    time.sleep(15)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -188,7 +190,7 @@ class DerivClient:
                 ws.send(json.dumps(req))
             except Exception:
                 logger.exception("Failed to subscribe to %s", target_sym)
-            time.sleep(0.05)
+            time.sleep(0.08)
 
     def on_message(self, ws, message):
         try:

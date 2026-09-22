@@ -34,7 +34,6 @@ logging.basicConfig(
 
 logger = logging.getLogger("QuotexSignalBoard")
 
-# This must be defined globally at module level for 'bot:app'
 app = Flask(__name__)
 init_db()
 
@@ -60,6 +59,13 @@ ready = threading.Event()
 
 _threads_started = False
 _threads_lock = threading.Lock()
+
+EXPIRY_SECONDS = int(getattr(cfg, "EXPIRY_SECONDS", 300))
+PAYOUT_PERCENT = float(getattr(cfg, "PAYOUT_PERCENT", 80.0))
+
+# Symbols auto-disabled by the per-pair performance filter.
+auto_disabled_symbols = set()
+auto_disabled_lock = threading.Lock()
 
 
 # ============================================================
@@ -181,6 +187,59 @@ def set_dispatch_status(target_epoch, status):
         conn.commit()
     finally:
         conn.close()
+
+
+# ============================================================
+# PER-PAIR AUTO-FILTER
+# ============================================================
+
+def refresh_auto_disabled_pairs():
+    """
+    Reads signal_history once per scan cycle: any symbol with
+    AUTO_FILTER_MIN_TRADES+ settled signals and a win rate below
+    AUTO_FILTER_MIN_WIN_RATE is excluded from scanning until it is
+    re-enabled manually (or the DB is cleared).
+    """
+    min_trades = int(getattr(cfg, "AUTO_FILTER_MIN_TRADES", 30))
+    min_wr = float(getattr(cfg, "AUTO_FILTER_MIN_WIN_RATE", 0.50))
+
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT symbol,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN result = 'WIN' THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN result = 'LOSS' THEN 1 ELSE 0 END) AS losses
+            FROM signal_history
+            WHERE result IN ('WIN', 'LOSS')
+            GROUP BY symbol
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    disabled = set()
+    for symbol, total, wins, losses in rows:
+        settled = (wins or 0) + (losses or 0)
+        if settled < min_trades:
+            continue
+        wr = (wins or 0) / float(settled)
+        if wr < min_wr:
+            disabled.add(symbol)
+            logger.warning(
+                "Auto-filter DISABLED %s: %s settled trades, WR=%.1f%% (min %.0f%%)",
+                symbol, settled, wr * 100.0, min_wr * 100.0,
+            )
+
+    with auto_disabled_lock:
+        auto_disabled_symbols.clear()
+        auto_disabled_symbols.update(disabled)
+
+
+def is_auto_disabled(symbol):
+    with auto_disabled_lock:
+        return symbol in auto_disabled_symbols
 
 
 # ============================================================
@@ -352,7 +411,7 @@ def feed_diagnostics(symbol):
             if v in live_state:
                 quote = live_state[v]
                 break
-        
+
         manager = candle_managers.get(symbol)
         candle = manager.get_latest_closed_candle("1M") if manager else None
         last_close = int(candle.close_epoch) if candle else None
@@ -361,7 +420,7 @@ def feed_diagnostics(symbol):
             quote = {
                 "epoch": last_close,
                 "price": float(candle.close),
-                "receipt": time.monotonic()
+                "receipt": time.monotonic(),
             }
 
         quote = dict(quote) if quote else None
@@ -377,7 +436,7 @@ def feed_diagnostics(symbol):
 
 
 # ============================================================
-# TELEGRAM DELIVERY
+# TELEGRAM DELIVERY (target: within 5s of candle open)
 # ============================================================
 
 def send_telegram_alert(candidate, target_epoch):
@@ -389,7 +448,7 @@ def send_telegram_alert(candidate, target_epoch):
         return "CONFIG_ERROR"
 
     tz = pytz.timezone(getattr(cfg, "TIMEZONE_NAME", "Asia/Dhaka"))
-    expiry = datetime.datetime.fromtimestamp(target_epoch + 60, tz)
+    expiry = datetime.datetime.fromtimestamp(target_epoch + EXPIRY_SECONDS, tz)
     details = candidate["details"]
 
     trend_5m = details.get("trend_5m", "UNAVAILABLE")
@@ -404,7 +463,8 @@ def send_telegram_alert(candidate, target_epoch):
         f"📊 Pair: {candidate['display_name']}\n"
         f"🎯 Action: {candidate['direction']}\n"
         f"⭐️ Score: {candidate['score']}/8 ({candidate['quality']})\n"
-        f"⏰ Expiry: {expiry.strftime('%H:%M:%S')} {getattr(cfg, 'TIMEZONE_NAME', 'Asia/Dhaka')}\n"
+        f"⏰ Expiry: {expiry.strftime('%H:%M:%S')} {getattr(cfg, 'TIMEZONE_NAME', 'Asia/Dhaka')} (5M)\n"
+        f"💰 Payout: {PAYOUT_PERCENT:.0f}%\n"
         f"{trend_line}"
         f"💡 Reason: {details.get('score_reason', 'N/A')}\n\n"
         "⚠️ Based on the Deriv quotation feed, not Quotex's own candles.\n"
@@ -429,14 +489,14 @@ def send_telegram_alert(candidate, target_epoch):
 
 
 # ============================================================
-# SIGNAL RECORDING AND DISPATCH
+# SIGNAL RECORDING AND DISPATCH (payout-aware, 5M expiry)
 # ============================================================
 
 def save_signal(candidate, target_epoch, entry_price):
     tz = pytz.timezone(getattr(cfg, "TIMEZONE_NAME", "Asia/Dhaka"))
     utc_now = datetime.datetime.now(datetime.timezone.utc)
     local_now = utc_now.astimezone(tz)
-    signal_id = f"{candidate['symbol']}_1M_{target_epoch}"
+    signal_id = f"{candidate['symbol']}_5M_{target_epoch}"
 
     conn = get_db_connection()
     try:
@@ -445,9 +505,10 @@ def save_signal(candidate, target_epoch, entry_price):
             INSERT OR IGNORE INTO signal_history (
                 signal_id, symbol, display_pair, timeframe, candle_epoch,
                 signal_timestamp_utc, signal_timestamp_bdt, direction, score, quality,
-                bias_15m, entry_reference_price, entry_reference_timestamp, created_at, result
+                bias_15m, entry_reference_price, entry_reference_timestamp, created_at, result,
+                payout_percent, expiry_seconds
             )
-            VALUES (?, ?, ?, '1M', ?, ?, ?, ?, ?, ?, 'NOT_USED', ?, ?, ?, 'PENDING')
+            VALUES (?, ?, ?, '5M', ?, ?, ?, ?, ?, ?, 'NOT_USED', ?, ?, ?, 'PENDING', ?, ?)
             """,
             (
                 signal_id,
@@ -462,6 +523,8 @@ def save_signal(candidate, target_epoch, entry_price):
                 entry_price,
                 utc_now.isoformat(),
                 local_now.isoformat(),
+                PAYOUT_PERCENT,
+                EXPIRY_SECONDS,
             ),
         )
         conn.commit()
@@ -503,9 +566,10 @@ def dispatch_best_signal(candidate, target_epoch):
                         "score": candidate["score"],
                         "quality": candidate["quality"],
                         "trend_5m": candidate["details"].get("trend_5m", "UNAVAILABLE"),
-                        "timeframe": "1M",
+                        "timeframe": "5M",
                         "target_candle_epoch": target_epoch,
-                        "expiry_epoch": target_epoch + 60,
+                        "expiry_epoch": target_epoch + EXPIRY_SECONDS,
+                        "payout_percent": PAYOUT_PERCENT,
                     },
                 )
             except Exception:
@@ -523,6 +587,8 @@ def evaluate_and_dispatch_all(target_epoch):
         return
 
     try:
+        refresh_auto_disabled_pairs()
+
         candidates = []
         reports = {}
         timestamp = datetime.datetime.now(pytz.timezone(getattr(cfg, "TIMEZONE_NAME", "Asia/Dhaka"))).isoformat()
@@ -535,12 +601,29 @@ def evaluate_and_dispatch_all(target_epoch):
                 "quality": "WAIT",
                 "bias": "NOT_USED",
                 "target_candle_epoch": target_epoch,
-                "expected_close_epoch": target_epoch,
+                "expected_close_epoch": target_epoch + EXPIRY_SECONDS,
                 "delivery": "NOT_SENT",
             }
 
             try:
+                if is_auto_disabled(symbol):
+                    report["score_reason"] = "PAIR_AUTO_DISABLED"
+                    reports[display] = report
+                    continue
+
                 report.update(feed_diagnostics(symbol))
+
+                manager = candle_managers.get(symbol)
+
+                # Quote-pair guard: the 1M candle that just closed MUST be
+                # the candle ending exactly at this boundary. If the forming
+                # candle has not closed yet (feed lag / reconnect), the
+                # pair is skipped instead of signalling on stale data.
+                latest_closed = manager.get_latest_closed_candle("1M") if manager else None
+                if latest_closed is None or int(latest_closed.close_epoch) != int(target_epoch):
+                    report["score_reason"] = "FORMING_CANDLE_NOT_CLOSED"
+                    reports[display] = report
+                    continue
 
                 raw_df = history_snapshot(symbol)
                 df = prepare_history(raw_df) if not raw_df.empty else raw_df
@@ -640,7 +723,7 @@ def evaluate_and_dispatch_all(target_epoch):
 
 
 # ============================================================
-# HISTORICAL DATA REFRESH
+# HISTORICAL DATA REFRESH (1M + 5M REST seeding, no 15M)
 # ============================================================
 
 def resync_historical_candles():
@@ -648,37 +731,45 @@ def resync_historical_candles():
         return
 
     try:
-        jobs = [
-            {
+        jobs = []
+        for symbol in cfg.FOREX_PAIRS:
+            jobs.append({
                 "key": f"{symbol}:1M",
                 "symbol": symbol,
-                "count": getattr(cfg, "CANDLE_HISTORY_LIMIT", 100),
+                "count": 300,
                 "granularity": 60,
-            }
-            for symbol in cfg.FOREX_PAIRS
-        ]
+            })
+            jobs.append({
+                "key": f"{symbol}:5M",
+                "symbol": symbol,
+                "count": 200,
+                "granularity": 300,
+            })
 
         histories = deriv_client.fetch_historical_candles_batch_sync(jobs)
         server_epoch = int(deriv_client.fetch_server_epoch_sync())
         updated = 0
 
         for symbol, manager in candle_managers.items():
-            raw = histories.get(f"{symbol}:1M", [])
-            if not raw:
+            raw_1m = histories.get(f"{symbol}:1M", [])
+            raw_5m = histories.get(f"{symbol}:5M", [])
+            if not raw_1m and not raw_5m:
                 continue
 
             with state_lock:
-                manager.seed_historical_candles("1M", raw, server_epoch)
-                if raw:
-                    last_c = raw[-1]
+                if raw_1m:
+                    manager.seed_historical_candles("1M", raw_1m, server_epoch)
+                    last_c = raw_1m[-1]
                     clean = symbol.replace("frx", "").replace("/", "").upper()
                     ep = int(last_c.get("epoch") or last_c.get("time") or server_epoch)
                     cl = float(last_c.get("close", 0))
                     for k in [symbol, clean, f"frx{clean}"]:
                         live_state[k] = {"epoch": ep, "price": cl, "receipt": time.monotonic()}
+                if raw_5m:
+                    manager.seed_historical_candles("5M", raw_5m, server_epoch)
             updated += 1
 
-        logger.info("M1 history refreshed for %s/%s pairs.", updated, len(cfg.FOREX_PAIRS))
+        logger.info("History refreshed (1M+5M) for %s/%s pairs.", updated, len(cfg.FOREX_PAIRS))
 
     except Exception:
         logger.exception("History refresh failed.")
@@ -706,7 +797,7 @@ def run_history_worker():
 
 
 # ============================================================
-# SCAN RETRIES WITHIN THE ENTRY WINDOW
+# SCAN WORKER — signal must fire within 5s of the candle opening
 # ============================================================
 
 def run_scan_worker():
@@ -726,29 +817,30 @@ def run_scan_worker():
                 last_attempt = 0.0
 
             if minute == finished_minute:
-                time.sleep(0.5)
+                time.sleep(0.2)
                 continue
 
-            scan_delay = getattr(cfg, "SCAN_DELAY_SECONDS", 2.0)
-            max_delay = getattr(cfg, "MAX_ENTRY_DELAY_SECONDS", 10.0)
+            scan_delay = float(getattr(cfg, "SCAN_DELAY_SECONDS", 0.2))
+            max_delay = float(getattr(cfg, "MAX_ENTRY_DELAY_SECONDS", 5.0))
 
+            # Hard cutoff: after 5 seconds post-candle-open we stop trying.
             if second > max_delay:
                 finished_minute = minute
-                time.sleep(0.5)
+                time.sleep(0.2)
                 continue
 
             if second < scan_delay:
-                time.sleep(0.5)
+                time.sleep(0.1)
                 continue
 
             if minute_has_dispatch_attempt(minute):
                 finished_minute = minute
-                time.sleep(0.5)
+                time.sleep(0.2)
                 continue
 
             monotonic_now = time.monotonic()
-            if monotonic_now - last_attempt < 2.0:
-                time.sleep(0.3)
+            if monotonic_now - last_attempt < 0.5:
+                time.sleep(0.1)
                 continue
 
             last_attempt = monotonic_now
@@ -758,7 +850,7 @@ def run_scan_worker():
             if attempted:
                 finished_minute = minute
 
-            time.sleep(0.5)
+            time.sleep(0.2)
 
         except Exception:
             logger.exception("Scan worker failed.")
@@ -766,7 +858,7 @@ def run_scan_worker():
 
 
 # ============================================================
-# ENGINE STARTUP
+# ENGINE STARTUP — 1M + 5M REST seeding (no 75-minute 5M gate)
 # ============================================================
 
 def run_engine():
@@ -778,13 +870,13 @@ def run_engine():
 
         resync_historical_candles()
         ready.set()
-        logger.info("Data engine initialized and history seeded. Signals are now active.")
+        logger.info("Data engine initialized and history seeded (1M+5M). Signals are now active.")
     except Exception:
         logger.exception("Data engine failed to start.")
 
 
 # ============================================================
-# HYPOTHETICAL OUTCOMES
+# HYPOTHETICAL OUTCOMES (5M expiry)
 # ============================================================
 
 def _prune_dispatch_ledger(older_than_seconds: int = 86400):
@@ -823,14 +915,18 @@ def run_outcome_worker():
             now = deriv_client.get_server_time()
 
             for signal_id, symbol, target, direction, entry in rows:
-                if not entry or symbol not in candle_managers or now < int(target) + 60:
+                # Entry happens at the open of the candle `target`; a 5M
+                # expiry exits at the close of the LAST 1M candle of the
+                # expiry window, i.e. candle epoch target + EXPIRY - 60.
+                exit_candle_epoch = int(target) + EXPIRY_SECONDS - 60
+                if not entry or symbol not in candle_managers or now < exit_candle_epoch + 60 + 5:
                     continue
 
                 df = history_snapshot(symbol)
                 if df.empty or "time" not in df.columns:
                     continue
 
-                match = df[df["time"] == int(target)]
+                match = df[df["time"] == exit_candle_epoch]
                 if match.empty:
                     continue
 
@@ -916,6 +1012,9 @@ def health():
         "fresh_pairs": fresh,
         "total_pairs": total,
         "signals_enabled": cfg.SIGNALS_ENABLED,
+        "auto_disabled_pairs": sorted(auto_disabled_symbols),
+        "expiry_seconds": EXPIRY_SECONDS,
+        "payout_percent": PAYOUT_PERCENT,
     })
 
 
@@ -931,6 +1030,7 @@ def api_dashboard():
         "performance": get_today_performance(),
         "performance_basis": "hypothetical Deriv reference prices",
         "active_pairs": list(cfg.FOREX_PAIRS.values()),
+        "auto_disabled_pairs": sorted(auto_disabled_symbols),
     })
 
 
@@ -946,7 +1046,8 @@ def signal_rows(active_only=False):
         query = """
             SELECT signal_id, display_pair, timeframe, signal_timestamp_bdt,
                    direction, score, quality, bias_15m, entry_reference_price,
-                   exit_reference_price, result, candle_epoch
+                   exit_reference_price, result, candle_epoch, payout_percent,
+                   expiry_seconds
             FROM signal_history
         """
         if active_only:
@@ -971,6 +1072,8 @@ def signal_rows(active_only=False):
             "exit_price": row[9],
             "result": row[10],
             "target_candle_epoch": row[11],
+            "payout_percent": row[12],
+            "expiry_seconds": row[13],
             "performance_basis": "hypothetical Deriv reference prices",
         }
         for row in rows

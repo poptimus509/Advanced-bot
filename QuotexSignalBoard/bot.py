@@ -1,11 +1,5 @@
 """
-Main Trading Bot Coordinator for Quotex Signal Board (1M Precision Optimized).
-Includes:
-  1. High-frequency scan worker (0.25s sleep, 1.0s interval).
-  2. Per-pair cooldown protection to prevent signal spamming.
-  3. Session filter to reject quiet Asian session hours.
-  4. Mandatory 1M + 5M REST history seeding.
-  5. Actionable Telegram alert message reminding traders to enter within 10-15s.
+Main Trading Bot Coordinator for Quotex Signal Board (24/7 Unrestricted Mode).
 """
 
 import datetime
@@ -584,7 +578,7 @@ def dispatch_best_signal(candidate, target_epoch):
 
 
 # ============================================================
-# EVALUATION & DISPATCH WORKER (SESSION & COOLDOWN GATED)
+# EVALUATION & DISPATCH WORKER (24/7 UNRESTRICTED)
 # ============================================================
 
 def evaluate_and_dispatch_all(target_epoch):
@@ -592,13 +586,6 @@ def evaluate_and_dispatch_all(target_epoch):
         return
 
     try:
-        # 1. Asian Session Dead Hours Filter (UTC)
-        utc_hour = datetime.datetime.now(datetime.timezone.utc).hour
-        start, end = getattr(cfg, "SIGNAL_HOURS_UTC", (0, 24))
-        if not (start <= utc_hour < end):
-            logger.info("Trading hours filter active: UTC %s is outside window %s-%s.", utc_hour, start, end)
-            return
-
         refresh_auto_disabled_pairs()
 
         candidates = []
@@ -624,7 +611,6 @@ def evaluate_and_dispatch_all(target_epoch):
                     reports[display] = report
                     continue
 
-                # 2. Per-Pair Cooldown Check
                 if symbol_in_cooldown(symbol, cooldown_mins):
                     report["delivery"] = "PAIR_COOLDOWN"
                     report["score_reason"] = f"COOLDOWN_{cooldown_mins}M"
@@ -741,7 +727,6 @@ def resync_historical_candles():
                 "count": 300,
                 "granularity": 60,
             })
-            # 5M History Seeding
             jobs.append({
                 "key": f"{symbol}:5M",
                 "symbol": symbol,
@@ -800,7 +785,7 @@ def run_history_worker():
 
 
 # ============================================================
-# SCAN WORKER — HIGH SPEED (0.25s sleep, 1.0s attempt throttle)
+# SCAN WORKER — HIGH SPEED (0.25s sleep, 1.0s throttle)
 # ============================================================
 
 def run_scan_worker():
@@ -841,7 +826,7 @@ def run_scan_worker():
                 continue
 
             monotonic_now = time.monotonic()
-            if monotonic_now - last_attempt < 1.0:  # Throttled attempt limit (2.0 -> 1.0s)
+            if monotonic_now - last_attempt < 1.0:
                 time.sleep(0.05)
                 continue
 
@@ -852,7 +837,7 @@ def run_scan_worker():
             if attempted:
                 finished_minute = minute
 
-            time.sleep(0.25)  # Fast poll sleep (0.5 -> 0.25s)
+            time.sleep(0.25)
 
         except Exception:
             logger.exception("Scan worker failed.")
@@ -872,7 +857,7 @@ def run_engine():
 
         resync_historical_candles()
         ready.set()
-        logger.info("Data engine initialized and seeded (1M+5M). Signals active.")
+        logger.info("Data engine initialized and seeded (1M+5M). Signals active 24/7.")
     except Exception:
         logger.exception("Data engine failed to start.")
 

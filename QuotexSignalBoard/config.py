@@ -36,7 +36,7 @@ MIN_1M_HISTORY = 20
 STALE_TICK_THRESHOLD_SEC = 25.0
 
 # Strategy scoring threshold (Reduced to 6 so valid currency pairs can trigger signals)
-SIGNAL_THRESHOLD_CALL_PUT = 6
+SIGNAL_THRESHOLD_CALL_PUT = 8
 
 DB_PATH = os.environ.get("DB_PATH", "signal_board.db")
 TIMEZONE_NAME = "Asia/Dhaka"

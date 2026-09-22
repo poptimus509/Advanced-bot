@@ -1,3 +1,13 @@
+"""
+Main Trading Bot Coordinator for Quotex Signal Board (1M Precision Optimized).
+Includes:
+  1. High-frequency scan worker (0.25s sleep, 1.0s interval).
+  2. Per-pair cooldown protection to prevent signal spamming.
+  3. Session filter to reject quiet Asian session hours.
+  4. Mandatory 1M + 5M REST history seeding.
+  5. Actionable Telegram alert message reminding traders to enter within 10-15s.
+"""
+
 import datetime
 import logging
 import math
@@ -24,7 +34,7 @@ from strategy import evaluate_strategy, prepare_history
 
 
 # ============================================================
-# LOGGING AND APPLICATION (EXPOSED GLOBALLY FOR GUNICORN)
+# LOGGING AND APPLICATION SETUP
 # ============================================================
 
 logging.basicConfig(
@@ -60,10 +70,9 @@ ready = threading.Event()
 _threads_started = False
 _threads_lock = threading.Lock()
 
-EXPIRY_SECONDS = int(getattr(cfg, "EXPIRY_SECONDS", 300))
-PAYOUT_PERCENT = float(getattr(cfg, "PAYOUT_PERCENT", 80.0))
+EXPIRY_SECONDS = int(getattr(cfg, "EXPIRY_SECONDS", 60))
+PAYOUT_PERCENT = float(getattr(cfg, "PAYOUT_PERCENT", 85.0))
 
-# Symbols auto-disabled by the per-pair performance filter.
 auto_disabled_symbols = set()
 auto_disabled_lock = threading.Lock()
 
@@ -85,7 +94,7 @@ if (
             app_id=cfg.PUSHER_APP_ID,
             key=cfg.PUSHER_KEY,
             secret=cfg.PUSHER_SECRET,
-            cluster=getattr(cfg, "PUSHER_CLUSTER", "mt1"),
+            cluster=getattr(cfg, "PUSHER_CLUSTER", "ap2"),
             ssl=True,
         )
     except Exception:
@@ -93,7 +102,7 @@ if (
 
 
 # ============================================================
-# PERSISTENT DELIVERY DEDUPLICATION
+# PERSISTENT DELIVERY DEDUPLICATION & COOLDOWN
 # ============================================================
 
 def init_dispatch_ledger():
@@ -118,13 +127,28 @@ def init_dispatch_ledger():
 init_dispatch_ledger()
 
 
-def used_setup(symbol, setup_id):
+def symbol_in_cooldown(symbol: str, cooldown_minutes: int) -> bool:
+    """Checks if pair dispatched an alert within cooldown minutes."""
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT candle_epoch FROM signal_history WHERE symbol = ? ORDER BY candle_epoch DESC LIMIT 1",
+            (symbol,),
+        ).fetchone()
+        if not row or not row["candle_epoch"]:
+            return False
+        server_now = deriv_client.get_server_time()
+        return (server_now - int(row["candle_epoch"])) < (cooldown_minutes * 60)
+    finally:
+        conn.close()
+
+
+def used_setup(symbol: str, setup_id: str) -> bool:
     conn = get_db_connection()
     try:
         row = conn.execute(
             """
-            SELECT 1
-            FROM dispatch_ledger_v2
+            SELECT 1 FROM dispatch_ledger_v2
             WHERE symbol = ? AND setup_id = ?
             """,
             (symbol, setup_id),
@@ -134,13 +158,12 @@ def used_setup(symbol, setup_id):
         conn.close()
 
 
-def minute_has_dispatch_attempt(target_epoch):
+def minute_has_dispatch_attempt(target_epoch: int) -> bool:
     conn = get_db_connection()
     try:
         row = conn.execute(
             """
-            SELECT 1
-            FROM dispatch_ledger_v2
+            SELECT 1 FROM dispatch_ledger_v2
             WHERE target_epoch = ?
             """,
             (target_epoch,),
@@ -150,16 +173,13 @@ def minute_has_dispatch_attempt(target_epoch):
         conn.close()
 
 
-def reserve_dispatch(symbol, setup_id, target_epoch):
+def reserve_dispatch(symbol: str, setup_id: str, target_epoch: int) -> bool:
     conn = get_db_connection()
     try:
         conn.execute(
             """
             INSERT INTO dispatch_ledger_v2 (
-                target_epoch,
-                symbol,
-                setup_id,
-                status
+                target_epoch, symbol, setup_id, status
             )
             VALUES (?, ?, ?, 'ATTEMPTING')
             """,
@@ -173,7 +193,7 @@ def reserve_dispatch(symbol, setup_id, target_epoch):
         conn.close()
 
 
-def set_dispatch_status(target_epoch, status):
+def set_dispatch_status(target_epoch: int, status: str):
     conn = get_db_connection()
     try:
         conn.execute(
@@ -194,12 +214,6 @@ def set_dispatch_status(target_epoch, status):
 # ============================================================
 
 def refresh_auto_disabled_pairs():
-    """
-    Reads signal_history once per scan cycle: any symbol with
-    AUTO_FILTER_MIN_TRADES+ settled signals and a win rate below
-    AUTO_FILTER_MIN_WIN_RATE is excluded from scanning until it is
-    re-enabled manually (or the DB is cleared).
-    """
     min_trades = int(getattr(cfg, "AUTO_FILTER_MIN_TRADES", 30))
     min_wr = float(getattr(cfg, "AUTO_FILTER_MIN_WIN_RATE", 0.50))
 
@@ -228,7 +242,7 @@ def refresh_auto_disabled_pairs():
         if wr < min_wr:
             disabled.add(symbol)
             logger.warning(
-                "Auto-filter DISABLED %s: %s settled trades, WR=%.1f%% (min %.0f%%)",
+                "Auto-filter DISABLED %s: %s trades, WR=%.1f%% (min %.0f%%)",
                 symbol, settled, wr * 100.0, min_wr * 100.0,
             )
 
@@ -237,13 +251,13 @@ def refresh_auto_disabled_pairs():
         auto_disabled_symbols.update(disabled)
 
 
-def is_auto_disabled(symbol):
+def is_auto_disabled(symbol: str) -> bool:
     with auto_disabled_lock:
         return symbol in auto_disabled_symbols
 
 
 # ============================================================
-# SYMBOL HELPER & NORMALIZER
+# SYMBOL HELPER & TICK PROCESSING
 # ============================================================
 
 def get_symbol_variants(symbol: str):
@@ -256,10 +270,6 @@ def get_symbol_variants(symbol: str):
     }
     return list(variants)
 
-
-# ============================================================
-# LIVE TICK COLLECTION
-# ============================================================
 
 def make_tick_handler(symbol, manager):
     def handle(epoch, price, receipt_time):
@@ -323,7 +333,6 @@ for symbol in cfg.FOREX_PAIRS:
         event_dispatcher=event_dispatcher,
         max_history=getattr(cfg, "CANDLE_HISTORY_LIMIT", 200),
     )
-
     candle_managers[symbol] = manager
     handler = make_tick_handler(symbol, manager)
 
@@ -436,7 +445,7 @@ def feed_diagnostics(symbol):
 
 
 # ============================================================
-# TELEGRAM DELIVERY (target: within 5s of candle open)
+# TELEGRAM DELIVERY WITH TIMING WARNING
 # ============================================================
 
 def send_telegram_alert(candidate, target_epoch):
@@ -444,7 +453,7 @@ def send_telegram_alert(candidate, target_epoch):
         return "DISABLED"
 
     if not cfg.TELEGRAM_BOT_TOKEN or not cfg.TELEGRAM_CHAT_ID:
-        logger.error("Telegram configuration missing: check token and chat/channel ID.")
+        logger.error("Telegram configuration missing.")
         return "CONFIG_ERROR"
 
     tz = pytz.timezone(getattr(cfg, "TIMEZONE_NAME", "Asia/Dhaka"))
@@ -455,20 +464,19 @@ def send_telegram_alert(candidate, target_epoch):
     trend_line = (
         f"📈 5M Trend: {trend_5m}\n"
         if trend_5m != "UNAVAILABLE"
-        else "📈 5M Trend: not available (skipped - insufficient 5M history)\n"
+        else "📈 5M Trend: unavailable\n"
     )
 
     message = (
-        "⚡️ MARKET ANALYSIS SIGNAL ⚡️\n\n"
-        f"📊 Pair: {candidate['display_name']}\n"
-        f"🎯 Action: {candidate['direction']}\n"
-        f"⭐️ Score: {candidate['score']}/8 ({candidate['quality']})\n"
-        f"⏰ Expiry: {expiry.strftime('%H:%M:%S')} {getattr(cfg, 'TIMEZONE_NAME', 'Asia/Dhaka')} (5M)\n"
-        f"💰 Payout: {PAYOUT_PERCENT:.0f}%\n"
+        "⚡️ <b>QUOTEX 1M HIGH-SPEED SIGNAL</b> ⚡️\n\n"
+        f"📊 <b>Pair:</b> {candidate['display_name']}\n"
+        f"🎯 <b>Action:</b> <b>{candidate['direction']}</b>\n"
+        f"⭐️ <b>Score:</b> {candidate['score']}/{getattr(cfg, 'SIGNAL_THRESHOLD_CALL_PUT', 7)} ({candidate['quality']})\n"
+        f"⏰ <b>Expiry:</b> {expiry.strftime('%H:%M:%S')} {getattr(cfg, 'TIMEZONE_NAME', 'Asia/Dhaka')} (1M)\n"
+        f"💰 <b>Min Payout:</b> {PAYOUT_PERCENT:.0f}%\n"
         f"{trend_line}"
-        f"💡 Reason: {details.get('score_reason', 'N/A')}\n\n"
-        "⚠️ Based on the Deriv quotation feed, not Quotex's own candles.\n"
-        "This is not financial advice; no signal here guarantees a profitable trade."
+        f"💡 <b>Reason:</b> {details.get('score_reason', 'N/A')}\n\n"
+        "⚠️ <b>Enter within first 10–15 seconds of the new candle.</b>"
     )
 
     url = f"https://api.telegram.org/bot{cfg.TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -476,7 +484,7 @@ def send_telegram_alert(candidate, target_epoch):
     try:
         response = requests.post(
             url,
-            json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": message},
+            json={"chat_id": cfg.TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
             timeout=(2, 3),
         )
         body = response.json()
@@ -489,14 +497,14 @@ def send_telegram_alert(candidate, target_epoch):
 
 
 # ============================================================
-# SIGNAL RECORDING AND DISPATCH (payout-aware, 5M expiry)
+# SIGNAL RECORDING & DISPATCH (PAYOUT & EXPECTANCY TRACKING)
 # ============================================================
 
 def save_signal(candidate, target_epoch, entry_price):
     tz = pytz.timezone(getattr(cfg, "TIMEZONE_NAME", "Asia/Dhaka"))
     utc_now = datetime.datetime.now(datetime.timezone.utc)
     local_now = utc_now.astimezone(tz)
-    signal_id = f"{candidate['symbol']}_5M_{target_epoch}"
+    signal_id = f"{candidate['symbol']}_1M_{target_epoch}"
 
     conn = get_db_connection()
     try:
@@ -508,7 +516,7 @@ def save_signal(candidate, target_epoch, entry_price):
                 bias_15m, entry_reference_price, entry_reference_timestamp, created_at, result,
                 payout_percent, expiry_seconds
             )
-            VALUES (?, ?, ?, '5M', ?, ?, ?, ?, ?, ?, 'NOT_USED', ?, ?, ?, 'PENDING', ?, ?)
+            VALUES (?, ?, ?, '1M', ?, ?, ?, ?, ?, ?, 'NOT_USED', ?, ?, ?, 'PENDING', ?, ?)
             """,
             (
                 signal_id,
@@ -550,10 +558,7 @@ def dispatch_best_signal(candidate, target_epoch):
         try:
             save_signal(candidate, target_epoch, quote["price"])
         except Exception:
-            logger.exception(
-                "save_signal failed after SENT Telegram alert for %s %s",
-                candidate["symbol"], candidate["direction"],
-            )
+            logger.exception("save_signal failed for %s", candidate["symbol"])
 
         if pusher_client:
             try:
@@ -566,7 +571,7 @@ def dispatch_best_signal(candidate, target_epoch):
                         "score": candidate["score"],
                         "quality": candidate["quality"],
                         "trend_5m": candidate["details"].get("trend_5m", "UNAVAILABLE"),
-                        "timeframe": "5M",
+                        "timeframe": "1M",
                         "target_candle_epoch": target_epoch,
                         "expiry_epoch": target_epoch + EXPIRY_SECONDS,
                         "payout_percent": PAYOUT_PERCENT,
@@ -579,7 +584,7 @@ def dispatch_best_signal(candidate, target_epoch):
 
 
 # ============================================================
-# ALL-PAIR EVALUATION AND RANKING
+# EVALUATION & DISPATCH WORKER (SESSION & COOLDOWN GATED)
 # ============================================================
 
 def evaluate_and_dispatch_all(target_epoch):
@@ -587,11 +592,19 @@ def evaluate_and_dispatch_all(target_epoch):
         return
 
     try:
+        # 1. Asian Session Dead Hours Filter (UTC)
+        utc_hour = datetime.datetime.now(datetime.timezone.utc).hour
+        start, end = getattr(cfg, "SIGNAL_HOURS_UTC", (0, 24))
+        if not (start <= utc_hour < end):
+            logger.info("Trading hours filter active: UTC %s is outside window %s-%s.", utc_hour, start, end)
+            return
+
         refresh_auto_disabled_pairs()
 
         candidates = []
         reports = {}
         timestamp = datetime.datetime.now(pytz.timezone(getattr(cfg, "TIMEZONE_NAME", "Asia/Dhaka"))).isoformat()
+        cooldown_mins = getattr(cfg, "PAIR_COOLDOWN_MINUTES", 10)
 
         for symbol, display in cfg.FOREX_PAIRS.items():
             report = {
@@ -611,14 +624,16 @@ def evaluate_and_dispatch_all(target_epoch):
                     reports[display] = report
                     continue
 
+                # 2. Per-Pair Cooldown Check
+                if symbol_in_cooldown(symbol, cooldown_mins):
+                    report["delivery"] = "PAIR_COOLDOWN"
+                    report["score_reason"] = f"COOLDOWN_{cooldown_mins}M"
+                    reports[display] = report
+                    continue
+
                 report.update(feed_diagnostics(symbol))
 
                 manager = candle_managers.get(symbol)
-
-                # Quote-pair guard: the 1M candle that just closed MUST be
-                # the candle ending exactly at this boundary. If the forming
-                # candle has not closed yet (feed lag / reconnect), the
-                # pair is skipped instead of signalling on stale data.
                 latest_closed = manager.get_latest_closed_candle("1M") if manager else None
                 if latest_closed is None or int(latest_closed.close_epoch) != int(target_epoch):
                     report["score_reason"] = "FORMING_CANDLE_NOT_CLOSED"
@@ -631,7 +646,7 @@ def evaluate_and_dispatch_all(target_epoch):
                 if not df.empty and "time" in df.columns:
                     df = df[df["time"] <= target_epoch].reset_index(drop=True)
 
-                min_history = getattr(cfg, "MIN_1M_HISTORY", 60)
+                min_history = getattr(cfg, "MIN_1M_HISTORY", 20)
                 if df.empty or len(df) < min_history:
                     report["score_reason"] = "LATEST_CLOSED_CANDLE_MISSING"
                     reports[display] = report
@@ -696,19 +711,6 @@ def evaluate_and_dispatch_all(target_epoch):
             )
         )
 
-        missing_count = sum(
-            1 for report in reports.values()
-            if report.get("score_reason") == "LATEST_CLOSED_CANDLE_MISSING"
-        )
-
-        logger.info(
-            "Scan: %s pairs, %s candidates, missing_candles=%s, signals_enabled=%s",
-            len(reports),
-            len(candidates),
-            missing_count,
-            cfg.SIGNALS_ENABLED,
-        )
-
         if candidates and cfg.SIGNALS_ENABLED:
             best_candidate = candidates[0]
             status = dispatch_best_signal(best_candidate, target_epoch)
@@ -723,7 +725,7 @@ def evaluate_and_dispatch_all(target_epoch):
 
 
 # ============================================================
-# HISTORICAL DATA REFRESH (1M + 5M REST seeding, no 15M)
+# HISTORICAL DATA REFRESH (1M + 5M REST SEEDING)
 # ============================================================
 
 def resync_historical_candles():
@@ -739,10 +741,11 @@ def resync_historical_candles():
                 "count": 300,
                 "granularity": 60,
             })
+            # 5M History Seeding
             jobs.append({
                 "key": f"{symbol}:5M",
                 "symbol": symbol,
-                "count": 200,
+                "count": 100,
                 "granularity": 300,
             })
 
@@ -769,7 +772,7 @@ def resync_historical_candles():
                     manager.seed_historical_candles("5M", raw_5m, server_epoch)
             updated += 1
 
-        logger.info("History refreshed (1M+5M) for %s/%s pairs.", updated, len(cfg.FOREX_PAIRS))
+        logger.info("Seeded 1M & 5M candles for %s/%s pairs.", updated, len(cfg.FOREX_PAIRS))
 
     except Exception:
         logger.exception("History refresh failed.")
@@ -797,7 +800,7 @@ def run_history_worker():
 
 
 # ============================================================
-# SCAN WORKER — signal must fire within 5s of the candle opening
+# SCAN WORKER — HIGH SPEED (0.25s sleep, 1.0s attempt throttle)
 # ============================================================
 
 def run_scan_worker():
@@ -817,30 +820,29 @@ def run_scan_worker():
                 last_attempt = 0.0
 
             if minute == finished_minute:
-                time.sleep(0.2)
+                time.sleep(0.1)
                 continue
 
-            scan_delay = float(getattr(cfg, "SCAN_DELAY_SECONDS", 0.2))
+            scan_delay = float(getattr(cfg, "SCAN_DELAY_SECONDS", 1.0))
             max_delay = float(getattr(cfg, "MAX_ENTRY_DELAY_SECONDS", 5.0))
 
-            # Hard cutoff: after 5 seconds post-candle-open we stop trying.
             if second > max_delay:
                 finished_minute = minute
-                time.sleep(0.2)
+                time.sleep(0.1)
                 continue
 
             if second < scan_delay:
-                time.sleep(0.1)
+                time.sleep(0.05)
                 continue
 
             if minute_has_dispatch_attempt(minute):
                 finished_minute = minute
-                time.sleep(0.2)
+                time.sleep(0.1)
                 continue
 
             monotonic_now = time.monotonic()
-            if monotonic_now - last_attempt < 0.5:
-                time.sleep(0.1)
+            if monotonic_now - last_attempt < 1.0:  # Throttled attempt limit (2.0 -> 1.0s)
+                time.sleep(0.05)
                 continue
 
             last_attempt = monotonic_now
@@ -850,15 +852,15 @@ def run_scan_worker():
             if attempted:
                 finished_minute = minute
 
-            time.sleep(0.2)
+            time.sleep(0.25)  # Fast poll sleep (0.5 -> 0.25s)
 
         except Exception:
             logger.exception("Scan worker failed.")
-            time.sleep(1)
+            time.sleep(0.5)
 
 
 # ============================================================
-# ENGINE STARTUP — 1M + 5M REST seeding (no 75-minute 5M gate)
+# ENGINE STARTUP & HYPOTHETICAL OUTCOMES
 # ============================================================
 
 def run_engine():
@@ -870,14 +872,10 @@ def run_engine():
 
         resync_historical_candles()
         ready.set()
-        logger.info("Data engine initialized and history seeded (1M+5M). Signals are now active.")
+        logger.info("Data engine initialized and seeded (1M+5M). Signals active.")
     except Exception:
         logger.exception("Data engine failed to start.")
 
-
-# ============================================================
-# HYPOTHETICAL OUTCOMES (5M expiry)
-# ============================================================
 
 def _prune_dispatch_ledger(older_than_seconds: int = 86400):
     conn = get_db_connection()
@@ -895,7 +893,6 @@ def run_outcome_worker():
     last_prune = 0.0
     while True:
         time.sleep(10)
-
         now_monotonic = time.monotonic()
         if now_monotonic - last_prune > 3600:
             _prune_dispatch_ledger()
@@ -915,9 +912,6 @@ def run_outcome_worker():
             now = deriv_client.get_server_time()
 
             for signal_id, symbol, target, direction, entry in rows:
-                # Entry happens at the open of the candle `target`; a 5M
-                # expiry exits at the close of the LAST 1M candle of the
-                # expiry window, i.e. candle epoch target + EXPIRY - 60.
                 exit_candle_epoch = int(target) + EXPIRY_SECONDS - 60
                 if not entry or symbol not in candle_managers or now < exit_candle_epoch + 60 + 5:
                     continue
@@ -938,12 +932,7 @@ def run_outcome_worker():
                 elif direction != "CALL":
                     continue
 
-                if difference > 0:
-                    outcome = "WIN"
-                elif difference < 0:
-                    outcome = "LOSS"
-                else:
-                    outcome = "TIE"
+                outcome = "WIN" if difference > 0 else ("LOSS" if difference < 0 else "TIE")
 
                 conn.execute(
                     """
@@ -953,11 +942,10 @@ def run_outcome_worker():
                     """,
                     (outcome, exit_price, signal_id),
                 )
-
             conn.commit()
 
         except Exception:
-            logger.exception("Hypothetical outcome calculation failed.")
+            logger.exception("Outcome calculation failed.")
         finally:
             if conn is not None:
                 conn.close()
@@ -987,7 +975,7 @@ def before_request_func():
 
 
 # ============================================================
-# WEB ROUTES
+# FLASK WEB INTERFACE & METRICS
 # ============================================================
 
 @app.route("/", methods=["GET", "HEAD"])

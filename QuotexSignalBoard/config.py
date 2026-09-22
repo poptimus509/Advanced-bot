@@ -1,5 +1,8 @@
 import os
 
+DB_PATH = os.environ.get("DB_PATH", "signal_board.db")
+TIMEZONE_NAME = "Asia/Dhaka"
+
 # ------------------------------------------------------------------
 # Every value below is actually read somewhere in the codebase.
 # ------------------------------------------------------------------
@@ -38,9 +41,9 @@ STALE_TICK_THRESHOLD_SEC = 25.0
 # ------------------------------------------------------------------
 # STRATEGY: Pullback-then-continuation (replaces 8/8 momentum chasing)
 # Score components (max 8): trend(2) + pullback(2) + continuation(2)
-#                           + RSI slope(2). Threshold is 6. Decided.
+#                           + RSI slope(2). Threshold is 8.
 # ------------------------------------------------------------------
-SIGNAL_THRESHOLD_CALL_PUT = 6
+SIGNAL_THRESHOLD_CALL_PUT = 8
 
 # Expiry: 5 minutes (broker edge is far smaller than 1M turbo expiry)
 EXPIRY_SECONDS = 300

@@ -15,10 +15,13 @@ class DerivClient:
         self.ws = None
         self.is_running = False
         self.subscribed_symbols = set()
+        # Server time state: last tick epoch seen, and the offset between
+        # the server clock and the local monotonic clock at that moment.
         self.server_time = int(time.time())
+        self._local_skew = 0.0  # server_epoch - local_epoch, updated per tick
         self.connected = False
         self.tick_handlers = {}
-        
+
         self._req_id_counter = 0
         self._req_lock = threading.Lock()
         self._pending_requests: Dict[int, threading.Event] = {}
@@ -29,10 +32,26 @@ class DerivClient:
         return self.connected
 
     def get_server_time(self):
-        return int(time.time())
+        """
+        Server time derived from the Deriv tick stream (tick.epoch), NOT
+        from the local wall clock. Between ticks we extrapolate using the
+        skew measured against the local clock, so this keeps advancing
+        smoothly instead of freezing at the last tick.
+        """
+        return int(time.time() + self._local_skew)
 
     def fetch_server_epoch_sync(self):
-        return int(time.time())
+        return self.get_server_time()
+
+    def _record_server_epoch(self, epoch: int):
+        try:
+            epoch = int(epoch)
+            if epoch <= 0:
+                return
+            self.server_time = epoch
+            self._local_skew = epoch - time.time()
+        except Exception:
+            pass
 
     def _get_next_req_id(self) -> int:
         with self._req_lock:
@@ -119,8 +138,6 @@ class DerivClient:
         self.connect()
 
     def connect(self):
-        # This client only reads public ticks and candle history. The current
-        # public API needs neither an app_id nor legacy authorize messages.
         url = "wss://api.derivws.com/trading/v1/options/ws/public"
         self.is_running = True
 
@@ -138,8 +155,6 @@ class DerivClient:
                     self.ws.run_forever(
                         ping_interval=25,
                         ping_timeout=10,
-                        # Let websocket-client emit exactly one Origin header.
-                        # Default TLS certificate and hostname checks stay enabled.
                         origin="https://deriv.com",
                     )
                 except Exception as e:
@@ -163,7 +178,7 @@ class DerivClient:
         if hasattr(cfg, "ACTIVE_SYMBOLS"):
             pairs_to_sub.update(cfg.ACTIVE_SYMBOLS)
 
-        logger.info(f"DerivClient: Subscribing to live ticks for {len(pairs_to_sub)} pairs.")
+        logger.info(f"DerivClient: Subscribing to live ticks for {len(pairs_to_sub)} real-market pairs (no OTC).")
         for symbol in pairs_to_sub:
             clean = symbol.replace("frx", "").replace("/", "").upper()
             target_sym = f"frx{clean}"
@@ -180,8 +195,6 @@ class DerivClient:
             msg_type = data.get("msg_type")
             req_id = data.get("req_id")
 
-            # Deriv errors retain the request's msg_type (e.g. candles or tick).
-            # Check the error payload before dispatching by message type.
             if data.get("error"):
                 error = data["error"]
                 logger.warning("Deriv API error (%s): %s",
@@ -199,7 +212,9 @@ class DerivClient:
                     epoch = int(tick.get("epoch", time.time()))
                     quote = float(tick.get("quote", 0.0))
 
-                    self.server_time = epoch
+                    # Server clock = Deriv tick epoch (with local skew)
+                    self._record_server_epoch(epoch)
+
                     clean = symbol.replace("frx", "").replace("/", "").upper()
 
                     handler = (

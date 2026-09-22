@@ -1,35 +1,25 @@
 """
-Strategy engine for QuotexSignalBoard.
+Strategy engine for QuotexSignalBoard — Pullback-then-continuation edition.
 
-Design goals (see CORRECTIONS.md for the full rationale):
+The previous 8/8 mature-momentum chaser bought exhaustion tops (every
+component rewarded an already-extended move). This version does the
+opposite: it waits for a higher-timeframe trend, a 1M pullback into a
+value zone, and a continuation candle back in the trend direction.
 
-1.  Every scoring component must be measuring something independent.
-    The previous version scored "market structure", "5M trend" and "EMA
-    stack" from the *same* 1M closing price three separate times, which
-    inflated scores without adding real confluence.
+Scoring (max 8, threshold 6 — the only threshold, configured in config.py):
+  1. TREND (2 pts): 1M EMA21 > EMA50 with price above EMA21, optionally
+     gated by the real 5M regime (mandatory gate when 5M data is usable).
+  2. PULLBACK (2 pts): during an uptrend RSI(14) dipped into 40-50 within
+     the last PULLBACK_LOOKBACK_CANDLES bars (and mirrored 50-60 zone for
+     downtrends). This is the "value" entry — no more buying the top.
+  3. CONTINUATION (2 pts): the latest closed 1M candle is a real reaction
+     candle back in the trend direction (body/wick check, direction first).
+  4. RSI SLOPE (2 pts): RSI velocity — the last two RSI readings are rising
+     (CALL) / falling (PUT). Measures momentum rebuilding, not a static band.
 
-2.  "5M trend" must actually come from 5M candles. If the caller does not
-    have a real, sufficiently long 5M dataframe, the regime filter is
-    skipped rather than faked from 1M data.
-
-3.  The threshold must be calibrated against noise. A strategy that fires
-    on ~50% of pure random walk data is not "high-confluence" - it is a
-    coin flip with extra steps. See tests/test_strategy.py and the
-    accompanying noise-check in tests/test_noise_rejection.py.
-
-4.  No forced direction on ties. If bullish and bearish evidence are
-    equal, the correct answer is "no trade", not "always call".
-
-evaluate_strategy(df_1m, df_5m=None, external_context=None) is the public
-entry point. df_5m and external_context are optional, defensive inputs:
-if they are missing, malformed, or otherwise unusable, they are silently
-ignored and have no effect on the result (this is asserted by
-test_higher_timeframes_have_no_effect). When df_5m is a real, adequately
-sized 5-minute OHLC dataframe, it is used as a mandatory regime alignment
-gate, and when external_context carries a valid numeric "adx_5m", it is
-used as a volatility/trend-strength gate. Neither ever contributes score
-points on its own, so they cannot be double-counted against the 1M
-components.
+Gates (never add score): 5M regime alignment (when available) and ADX(14)
+on 5M for trend strength. Garbage/missing HTF data is a no-op, matching the
+original defensive contract.
 """
 
 import math
@@ -43,7 +33,7 @@ import config as cfg
 logger = logging.getLogger("QuotexSignalBoard.Strategy")
 
 MIN_ROWS = 15
-SWING_LOOKAROUND = 2  # bars required on each side to confirm a fractal pivot
+SWING_LOOKAROUND = 2
 
 
 # ------------------------------------------------------------------
@@ -62,12 +52,6 @@ def _infer_timeframe_seconds(times: np.ndarray) -> Optional[float]:
 
 
 def _latest_contiguous_segment(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Finds the timeframe's modal candle spacing and returns only the most
-    recent run of candles that respects that spacing, dropping anything
-    before a gap (missed candles, feed outage, symbol resync, etc.).
-    Never mutates the input.
-    """
     if "time" not in df.columns or len(df) < 3:
         return df
 
@@ -90,7 +74,7 @@ def prepare_history(df: pd.DataFrame) -> pd.DataFrame:
     """
     Standardizes a historical OHLC dataframe: trims to the latest
     contiguous run of candles, coerces numeric columns, and calculates
-    EMA/RSI/ATR. Always returns a new dataframe; never mutates the input.
+    EMA/RSI/ATR plus the RSI slope (velocity) series. Never mutates input.
     """
     if df is None or df.empty or len(df) < MIN_ROWS:
         return df if df is not None else pd.DataFrame()
@@ -115,6 +99,11 @@ def prepare_history(df: pd.DataFrame) -> pd.DataFrame:
     rs = gain / loss.replace(0, np.nan)
     work["rsi"] = 100 - (100 / (1 + rs))
     work["rsi"] = work["rsi"].fillna(50.0)
+
+    # RSI velocity (slope): momentum rebuilding vs fading, replaces the
+    # old static RSI band chase.
+    work["rsi_slope"] = work["rsi"].diff()
+    work["rsi_slope"] = work["rsi_slope"].fillna(0.0)
 
     high_low = work["high"] - work["low"]
     high_close = (work["high"] - work["close"].shift()).abs()
@@ -142,17 +131,10 @@ def _row_ohlc_is_valid(row) -> bool:
 
 
 # ------------------------------------------------------------------
-# 2. Structure: confirmed swing pivots (non-repainting)
+# 2. Structure: confirmed swing pivots (kept, non-repainting)
 # ------------------------------------------------------------------
 
 def confirmed_swings(df: pd.DataFrame, lookaround: int = SWING_LOOKAROUND) -> List[Dict[str, Any]]:
-    """
-    Detects fractal swing highs/lows. A pivot at index i only depends on
-    bars [i-lookaround, i+lookaround], so once confirmed it can never be
-    rewritten by future bars arriving later (no repainting). The pivot is
-    considered "confirmed" once i+lookaround bars exist, i.e. at index
-    (i + lookaround) in the sequence.
-    """
     swings: List[Dict[str, Any]] = []
     if df is None or len(df) < (2 * lookaround + 1):
         return swings
@@ -165,10 +147,6 @@ def confirmed_swings(df: pd.DataFrame, lookaround: int = SWING_LOOKAROUND) -> Li
         window_high = highs[i - lookaround: i + lookaround + 1]
         window_low = lows[i - lookaround: i + lookaround + 1]
 
-        # On a plateau (two adjacent bars tying for the window extreme,
-        # e.g. a flat top), always credit the leftmost bar so the result
-        # is deterministic and identical whether or not later bars have
-        # arrived yet (required for the no-repaint guarantee).
         if highs[i] == window_high.max() and i == (i - lookaround) + int(np.argmax(window_high)):
             swings.append({
                 "index": i,
@@ -212,14 +190,6 @@ def _structure_from_swings(swings: List[Dict[str, Any]]) -> str:
 # ------------------------------------------------------------------
 
 def activity_pressure(df: pd.DataFrame, baseline_window: int = None) -> Dict[str, Any]:
-    """
-    Historical candle "tick count" fields from a REST candle endpoint are
-    not real trade volume and must never be presented as one. This only
-    reports a signal when the dataframe carries genuine, verified live
-    tick counts (see data/candle_manager.py's verified_ticks column).
-    Otherwise it honestly reports UNAVAILABLE instead of inventing a
-    baseline of "10".
-    """
     result = {"activity_status": "UNAVAILABLE", "pressure": None, "relative_activity": None}
 
     if df is None or "verified_ticks" not in df.columns or len(df) < 3:
@@ -253,15 +223,16 @@ def activity_pressure(df: pd.DataFrame, baseline_window: int = None) -> Dict[str
 
 
 # ------------------------------------------------------------------
-# 4. Candle reaction: does the latest candle actually confirm direction?
+# 4. Continuation candle: latest candle confirms trend direction
 # ------------------------------------------------------------------
 
-def candle_reaction(current, previous, want_bullish: bool) -> Optional[Dict[str, Any]]:
+def continuation_candle(current, previous, want_bullish: bool) -> Optional[Dict[str, Any]]:
     """
-    Checks whether `current` is a real reaction candle in the requested
-    direction relative to `previous`. A bearish candle can never confirm
-    a bullish entry (and vice versa) - direction is checked first and is
-    non-negotiable.
+    Is the latest closed candle a genuine continuation candle back in the
+    trend direction after the pullback? Direction is checked first and is
+    non-negotiable: a bearish candle can never confirm a CALL (and vice
+    versa). Stronger than the old generic "reaction" check: the close must
+    also take out the previous candle's extreme in the trade direction.
     """
     try:
         c_open = float(current["open"])
@@ -282,19 +253,87 @@ def candle_reaction(current, previous, want_bullish: bool) -> Optional[Dict[str,
     if want_bullish:
         if not is_bull:
             return None
-        if lower_wick > body or c_close > p_high:
-            return {"type": "BULLISH_REACTION", "strength": round(body, 8)}
-        return {"type": "BULLISH_WEAK", "strength": round(body, 8)}
+        if body <= 0:
+            return None
+        if c_close > p_high or (lower_wick > 0 and lower_wick <= 0.5 * body and c_close >= p_high):
+            return {"type": "BULLISH_CONTINUATION", "strength": round(body, 8)}
+        return None
     else:
         if not is_bear:
             return None
-        if upper_wick > body or c_close < p_low:
-            return {"type": "BEARISH_REACTION", "strength": round(body, 8)}
-        return {"type": "BEARISH_WEAK", "strength": round(body, 8)}
+        if body <= 0:
+            return None
+        if c_close < p_low or (upper_wick > 0 and upper_wick <= 0.5 * body and c_close <= p_low):
+            return {"type": "BEARISH_CONTINUATION", "strength": round(body, 8)}
+        return None
 
 
 # ------------------------------------------------------------------
-# 5. Optional higher-timeframe / volatility gates (defensive, no-op on
+# 5. Pullback detection + RSI slope, trend definition
+# ------------------------------------------------------------------
+
+def _pullback_detected(rsi_series: pd.Series, want_bullish: bool) -> bool:
+    """
+    True if, within the last PULLBACK_LOOKBACK_CANDLES bars (excluding the
+    current confirmation bar), RSI visited the pullback value zone:
+      CALL (uptrend): RSI dipped into [40, 50]
+      PUT  (downtrend): RSI rose into [50, 60]
+    """
+    lookback = int(getattr(cfg, "PULLBACK_LOOKBACK_CANDLES", 6))
+    if rsi_series is None or len(rsi_series) < lookback + 1:
+        return False
+
+    window = pd.to_numeric(rsi_series.iloc[-(lookback + 1):-1], errors="coerce").dropna()
+    if len(window) < 2:
+        return False
+
+    if want_bullish:
+        lo = float(getattr(cfg, "RSI_PULLBACK_CALL_MIN", 40.0))
+        hi = float(getattr(cfg, "RSI_PULLBACK_CALL_MAX", 50.0))
+    else:
+        lo = float(getattr(cfg, "RSI_PULLBACK_PUT_MIN", 50.0))
+        hi = float(getattr(cfg, "RSI_PULLBACK_PUT_MAX", 60.0))
+
+    return bool(((window >= lo) & (window <= hi)).any())
+
+
+def _rsi_slope_confirms(rsi: pd.Series, rsi_slope: pd.Series, want_bullish: bool) -> bool:
+    """
+    RSI velocity: momentum must be REBUILDING in the trade direction on the
+    confirmation bar (and not collapsing). Replaces the old static band.
+    """
+    if rsi is None or rsi_slope is None or len(rsi) < 3:
+        return False
+    try:
+        last_slope = float(rsi_slope.iloc[-1])
+        prev_slope = float(rsi_slope.iloc[-2])
+        if not (math.isfinite(last_slope) and math.isfinite(prev_slope)):
+            return False
+        if want_bullish:
+            return last_slope > 0 and (prev_slope > 0 or last_slope > prev_slope)
+        return last_slope < 0 and (prev_slope < 0 or last_slope < prev_slope)
+    except Exception:
+        return False
+
+
+def _trend_bias_1m(prepared: pd.DataFrame) -> str:
+    """1M trend: EMA21 vs EMA50 with price location."""
+    try:
+        last = prepared.iloc[-1]
+        close = float(last["close"])
+        ema21 = float(last.get("ema_21", close))
+        ema50 = float(last.get("ema_50", close))
+        if close > ema21 > ema50:
+            return "BULLISH"
+        if close < ema21 < ema50:
+            return "BEARISH"
+        return "NEUTRAL"
+    except Exception:
+        return "NEUTRAL"
+
+
+# ------------------------------------------------------------------
+# 6. Optional higher-timeframe / volatility gates (defensive, no-op on
 #    invalid input - never contribute score points directly)
 # ------------------------------------------------------------------
 
@@ -346,7 +385,7 @@ def _safe_adx(external_context) -> Optional[float]:
 
 
 # ------------------------------------------------------------------
-# 6. Main entry point
+# 7. Main entry point
 # ------------------------------------------------------------------
 
 def _no_trade(reason: str, epoch: Any = 0) -> Tuple[str, int, str, Dict[str, Any]]:
@@ -372,15 +411,8 @@ def evaluate_strategy(
     external_context: Any = None,
 ) -> Tuple[str, int, str, Dict[str, Any]]:
     """
-    Evaluates one symbol's 1M history and returns
+    Pullback-then-continuation evaluation. Returns
     (direction, score, quality, details).
-
-    Every scoring component below is derived from a distinct piece of
-    evidence (structure via confirmed swings, EMA stack alignment,
-    RSI trend-following momentum, and the latest candle's reaction) so
-    that no single fact is counted twice. df_5m / external_context are
-    optional and gate-only (see module docstring); malformed values are
-    ignored and produce the exact same result as omitting them.
     """
     if df is None or df.empty or len(df) < MIN_ROWS:
         return _no_trade("INSUFFICIENT_DATA", 0)
@@ -401,7 +433,6 @@ def evaluate_strategy(
         atr = 0.0001
 
     curr_close = float(last_row["close"])
-    curr_rsi = float(last_row.get("rsi", 50.0))
     ema_9 = float(last_row.get("ema_9", curr_close))
     ema_21 = float(last_row.get("ema_21", curr_close))
     ema_50 = float(last_row.get("ema_50", curr_close))
@@ -410,57 +441,63 @@ def evaluate_strategy(
     structure = _structure_from_swings(swings)
     activity = activity_pressure(prepared)
 
+    rsi = prepared["rsi"]
+    rsi_slope = prepared["rsi_slope"]
+
+    bias_1m = _trend_bias_1m(prepared)
+
     call_score = 0
     put_score = 0
     call_reasons: List[str] = []
     put_reasons: List[str] = []
 
-    # 1) Market structure via confirmed swing pivots (independent of EMA/RSI)
-    if structure == "HH_HL":
-        call_score += 2
-        call_reasons.append("STRUCTURE_HH_HL")
-    elif structure == "LH_LL":
-        put_score += 2
-        put_reasons.append("STRUCTURE_LH_LL")
+    trend_5m = _safe_5m_bias(df_5m)
 
-    # 2) EMA stack alignment (trend direction of the 1M series)
-    if curr_close > ema_9 > ema_21 > ema_50:
+    # --- CALL side: uptrend pullback-continuation ---------------------
+    if bias_1m == "BULLISH" or (trend_5m == "BULLISH" and bias_1m != "BEARISH"):
         call_score += 2
-        call_reasons.append("EMA_BULLISH_STACK")
-    elif curr_close < ema_9 < ema_21 < ema_50:
-        put_score += 2
-        put_reasons.append("EMA_BEARISH_STACK")
+        call_reasons.append("TREND_UP_1M")
 
-    # 3) RSI trend-following momentum only (mean-reversion branch removed:
-    #    it previously awarded points to the OPPOSITE side of a strong
-    #    trend, contradicting the structure/EMA components above).
-    rsi_call_min = getattr(cfg, "RSI_CALL_MIN", 55.0)
-    rsi_call_max = getattr(cfg, "RSI_CALL_MAX", 70.0)
-    rsi_put_min = getattr(cfg, "RSI_PUT_MIN", 30.0)
-    rsi_put_max = getattr(cfg, "RSI_PUT_MAX", 45.0)
+        if _pullback_detected(rsi, want_bullish=True):
+            call_score += 2
+            call_reasons.append("RSI_PULLBACK_40_50")
 
-    if rsi_call_min < curr_rsi < rsi_call_max:
-        call_score += 2
-        call_reasons.append("RSI_BULLISH_MOMENTUM")
-    elif rsi_put_min < curr_rsi < rsi_put_max:
-        put_score += 2
-        put_reasons.append("RSI_BEARISH_MOMENTUM")
+        cont = continuation_candle(last_row, prev_row, want_bullish=True)
+        if cont is not None:
+            call_score += 2
+            call_reasons.append("BULLISH_CONTINUATION")
 
-    # 4) Candle reaction confirmation from the latest closed candle
-    bull_reaction = candle_reaction(last_row, prev_row, True)
-    bear_reaction = candle_reaction(last_row, prev_row, False)
-    if bull_reaction and bull_reaction["type"] == "BULLISH_REACTION":
-        call_score += 2
-        call_reasons.append("BULLISH_REACTION_CANDLE")
-    if bear_reaction and bear_reaction["type"] == "BEARISH_REACTION":
+        if _rsi_slope_confirms(rsi, rsi_slope, want_bullish=True):
+            call_score += 2
+            call_reasons.append("RSI_SLOPE_RISING")
+
+        if structure == "HH_HL":
+            call_reasons.append("STRUCTURE_HH_HL")
+
+    # --- PUT side: downtrend pullback-continuation --------------------
+    if bias_1m == "BEARISH" or (trend_5m == "BEARISH" and bias_1m != "BULLISH"):
         put_score += 2
-        put_reasons.append("BEARISH_REACTION_CANDLE")
+        put_reasons.append("TREND_DOWN_1M")
+
+        if _pullback_detected(rsi, want_bullish=False):
+            put_score += 2
+            put_reasons.append("RSI_PULLBACK_50_60")
+
+        cont = continuation_candle(last_row, prev_row, want_bullish=False)
+        if cont is not None:
+            put_score += 2
+            put_reasons.append("BEARISH_CONTINUATION")
+
+        if _rsi_slope_confirms(rsi, rsi_slope, want_bullish=False):
+            put_score += 2
+            put_reasons.append("RSI_SLOPE_FALLING")
+
+        if structure == "LH_LL":
+            put_reasons.append("STRUCTURE_LH_LL")
 
     call_score = min(call_score, 8)
     put_score = min(put_score, 8)
 
-    # No forced tie-break: if both sides are equally (un)supported, that
-    # is genuinely "no edge", not a coin flip resolved in CALL's favor.
     if call_score == put_score:
         final_score = call_score
         direction_candidate = "NONE"
@@ -480,23 +517,20 @@ def evaluate_strategy(
     else:
         quality = "WAIT"
 
-    signal_threshold = getattr(cfg, "SIGNAL_THRESHOLD_CALL_PUT", 8)
+    signal_threshold = getattr(cfg, "SIGNAL_THRESHOLD_CALL_PUT", 6)
 
     direction = "NO_TRADE"
     score_reason = "+".join((call_reasons if direction_candidate == "CALL" else put_reasons)[:3]) or "WAITING_SETUP"
     gate_reason = None
 
     if direction_candidate in ("CALL", "PUT") and final_score >= signal_threshold:
-        # Optional mandatory gates. Only ever applied when the caller
-        # supplied genuinely usable higher-timeframe / volatility data;
-        # garbage or missing input is a no-op (see module docstring).
-        bias_5m = _safe_5m_bias(df_5m)
         adx_5m = _safe_adx(external_context)
         min_adx = getattr(cfg, "MIN_ADX_5M", 20.0)
 
-        if bias_5m is not None and bias_5m != "NEUTRAL":
+        # Mandatory regime gate ONLY when real 5M data is usable.
+        if trend_5m is not None and trend_5m != "NEUTRAL":
             wanted = "BULLISH" if direction_candidate == "CALL" else "BEARISH"
-            if bias_5m != wanted:
+            if trend_5m != wanted:
                 gate_reason = "5M_REGIME_CONFLICT"
 
         if gate_reason is None and adx_5m is not None and adx_5m < min_adx:
@@ -510,7 +544,7 @@ def evaluate_strategy(
     details = {
         "score_reason": score_reason,
         "structure": structure,
-        "trend_5m": _safe_5m_bias(df_5m) or "UNAVAILABLE",
+        "trend_5m": trend_5m or "UNAVAILABLE",
         "call_score": call_score,
         "put_score": put_score,
         "atr": atr,

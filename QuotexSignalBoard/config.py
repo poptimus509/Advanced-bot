@@ -1,5 +1,5 @@
 """
-Configuration settings for Quotex Signal Board (1M Precision & Fast Execution).
+Configuration settings for Quotex Signal Board (1M Precision & 24/7 Execution).
 """
 
 import os
@@ -40,15 +40,12 @@ MIN_1M_HISTORY = 20
 STALE_TICK_THRESHOLD_SEC = 25.0
 
 # ------------------------------------------------------------------
-# STRATEGY TUNING & EXECUTION TIMING (1M OPTIMIZED)
+# STRATEGY TUNING & 24/7 EXECUTION TIMING
 # ------------------------------------------------------------------
-# Threshold tuned to 7 with mandatory 5M regime, ADX, and Anti-Chase gates
 SIGNAL_THRESHOLD_CALL_PUT = 7
-
-# Expiry for 1M turbo execution
 EXPIRY_SECONDS = 60
 
-# Quotex minimum expected payout
+# Payout settings
 PAYOUT_PERCENT = 85.0
 MIN_PAYOUT_PERCENT = 85.0
 
@@ -65,13 +62,17 @@ PULLBACK_LOOKBACK_CANDLES = 6
 
 ACTIVITY_BASELINE_CANDLES = 20
 
-# Strict Latency & Entry Filters
-SCAN_DELAY_SECONDS = 1.0        # Optimized from 2.0 -> 1.0 for rapid dispatch
-MAX_ENTRY_DELAY_SECONDS = 5.0   # Strict fresh candle boundary limit (10.0 -> 5.0)
+# Latency & Entry Window Filters
+SCAN_DELAY_SECONDS = 1.0
+MAX_ENTRY_DELAY_SECONDS = 5.0
 
-# Cooldown & Asian Session Filters
-PAIR_COOLDOWN_MINUTES = 10      # Prevent repetitive alerts on the same pair
-SIGNAL_HOURS_UTC = (1, 15)      # 01:00 UTC - 15:00 UTC (07:00 AM - 09:00 PM BD Time)
+# Cooldown
+PAIR_COOLDOWN_MINUTES = 10
+
+# ------------------------------------------------------------------
+# 24/7 FULL OPERATION (NO RESTRICTION)
+# ------------------------------------------------------------------
+SIGNAL_HOURS_UTC = (0, 24)
 
 # Auto-filter guards
 AUTO_FILTER_MIN_TRADES = 30

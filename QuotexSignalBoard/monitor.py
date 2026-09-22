@@ -1,4 +1,5 @@
 import datetime
+import sqlite3
 import pytz
 from config import TIMEZONE_NAME
 from database import get_db_connection
@@ -20,6 +21,7 @@ def get_today_performance():
     
     conn = get_db_connection()
     cursor = conn.cursor()
+    cursor.row_factory = sqlite3.Row
     
     cursor.execute("""
     SELECT 

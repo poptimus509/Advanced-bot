@@ -11,7 +11,6 @@ from data.data_quality import DataQualityStatus, SymbolHealthTracker
 TIMEFRAME_SECONDS = {
     "1M": 60,
     "5M": 300,
-    "15M": 900
 }
 
 class CandleManager:
@@ -20,24 +19,23 @@ class CandleManager:
         self.dispatcher = event_dispatcher
         self.max_history = max_history
         self._mutex = threading.Lock()
-        
+
         self.health_tracker = SymbolHealthTracker()
 
         self._closed_candles: Dict[str, Deque[Candle]] = {
             "1M": deque(maxlen=max_history),
             "5M": deque(maxlen=max_history),
-            "15M": deque(maxlen=max_history)
         }
 
         self._forming_candles: Dict[str, Optional[dict]] = {
             "1M": None,
             "5M": None,
-            "15M": None
         }
 
+        # Aggregated 1M candles pending inclusion in the next 5M candle.
+        # Pruned every 5M close so it can never grow without bound.
         self._mtf_1m_buffer: Dict[str, List[Candle]] = {
             "5M": [],
-            "15M": []
         }
 
     @staticmethod
@@ -48,14 +46,8 @@ class CandleManager:
         """
         Merges REST-fetched historical candles into _closed_candles.
 
-        IMPORTANT: this used to call self._closed_candles[timeframe].clear()
-        every time, which ran once a minute from bot.py's history worker.
-        That wiped out every candle built live from ticks (including the
-        currently forming candle) each time it ran, so the tick pipeline,
-        latency tracker and verified_ticks accounting were only ever
-        correct for a few seconds after each resync. This version only
-        ADDS candles that aren't already present and never touches the
-        forming candle, so a REST resync can no longer erase live state.
+        Only ADDS candles that aren't already present and never touches
+        the forming candle, so a REST resync can never erase live state.
         """
         if not raw_candles:
             return
@@ -85,17 +77,11 @@ class CandleManager:
 
                     close_epoch = epoch + tf_sec
 
-                    # Never resurrect a candle that has already closed and
-                    # been recorded, and never overwrite the live-built
-                    # forming candle - REST history is only used to fill
-                    # gaps, not to override ticks we already have.
                     if epoch in existing_epochs:
                         continue
                     if forming_epoch is not None and epoch == forming_epoch:
                         continue
                     if close_epoch > now_epoch:
-                        # This candle hasn't actually closed yet according
-                        # to the server clock; skip it rather than guessing.
                         continue
 
                     o = float(c.get("open", 0.0))
@@ -124,8 +110,6 @@ class CandleManager:
             if not new_candles:
                 return
 
-            # Only seed a forming candle if we don't already have live
-            # ticks building one (i.e. this is a cold start).
             if forming is None and sorted_raw:
                 last_raw = sorted_raw[-1]
                 try:
@@ -143,8 +127,6 @@ class CandleManager:
                 except Exception:
                     pass
 
-            # Merge and re-sort (deque with maxlen keeps only the most
-            # recent max_history candles, oldest evicted first).
             merged = sorted(
                 list(self._closed_candles[timeframe]) + new_candles,
                 key=lambda c: c.epoch
@@ -202,7 +184,7 @@ class CandleManager:
                 metrics_captured.append(metric)
 
                 df_history_1m = self._build_dataframe("1M")
-                
+
                 ev_1m = CandleClosedEvent(
                     symbol=self.symbol,
                     timeframe="1M",
@@ -214,7 +196,9 @@ class CandleManager:
                 setattr(ev_1m, "epoch", prev_1m_candle.epoch)
                 closed_1m_events_to_dispatch.append(ev_1m)
 
-                for htf in ["5M", "15M"]:
+                # Aggregate into the 5M buffer; on each 5M close, build the
+                # 5M candle and PRUNE the buffer (bounded memory).
+                for htf in ["5M"]:
                     htf_sec = TIMEFRAME_SECONDS[htf]
                     self._mtf_1m_buffer[htf].append(prev_1m_candle)
 
@@ -222,7 +206,7 @@ class CandleManager:
                     if next_1m_boundary % htf_sec == 0:
                         htf_epoch = next_1m_boundary - htf_sec
                         constituent_candles = [c for c in self._mtf_1m_buffer[htf] if c.epoch >= htf_epoch]
-                        
+
                         if constituent_candles:
                             htf_candle = Candle(
                                 symbol=self.symbol,
@@ -237,7 +221,11 @@ class CandleManager:
                                 close_epoch=next_1m_boundary
                             )
                             self._closed_candles[htf].append(htf_candle)
-                            self._mtf_1m_buffer[htf] = [c for c in self._mtf_1m_buffer[htf] if c.epoch >= next_1m_boundary]
+                            # Prune the MTF buffer at every 5M close.
+                            self._mtf_1m_buffer[htf] = [
+                                c for c in self._mtf_1m_buffer[htf]
+                                if c.epoch >= next_1m_boundary
+                            ]
 
                             df_history_htf = self._build_dataframe(htf)
                             ev_htf = CandleClosedEvent(

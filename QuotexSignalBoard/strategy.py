@@ -372,16 +372,16 @@ def evaluate_strategy(
         atr = 0.0001
 
     # ------------------------------------------------------------------
-    # Step A: Anti-Chase Climax Filter (Early Rejection)
+    # Step A: Anti-Chase Climax Filter
     # ------------------------------------------------------------------
     last_body = abs(float(last_row["close"]) - float(last_row["open"]))
     prev_body = abs(float(prev_row["close"]) - float(prev_row["open"]))
 
-    # Last candle > 1.2 * ATR indicates move exhaustion / climax
+    # Reject if last candle > 1.2 * ATR
     if last_body > 1.2 * atr:
         return _no_trade("CLIMAX_CANDLE", epoch)
 
-    # Previous candle was climax and current is weak drift
+    # Reject weak drift after strong climax
     if prev_body > 1.5 * atr and last_body < 0.5 * atr:
         return _no_trade("POST_CLIMAX_DRIFT", epoch)
 
@@ -407,7 +407,7 @@ def evaluate_strategy(
     put_reasons: List[str] = []
 
     # ------------------------------------------------------------------
-    # Step B: Scoring Engine with RSI Directional Slope
+    # Step B: Scoring Engine with Directional RSI Slope
     # ------------------------------------------------------------------
     # CALL side scoring
     if bias_1m == "BULLISH" or (trend_5m == "BULLISH" and bias_1m != "BEARISH"):
@@ -482,7 +482,7 @@ def evaluate_strategy(
     score_reason = "+".join((call_reasons if direction_candidate == "CALL" else put_reasons)[:3]) or "WAITING_SETUP"
 
     # ------------------------------------------------------------------
-    # Step C: Mandatory 5M Regime & ADX Gates (No Silent Skips)
+    # Step C: Mandatory 5M Regime & ADX Gates
     # ------------------------------------------------------------------
     if direction_candidate in ("CALL", "PUT") and final_score >= signal_threshold:
         adx_5m = _safe_adx(external_context)

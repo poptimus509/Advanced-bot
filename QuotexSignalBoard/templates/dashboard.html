@@ -21,7 +21,7 @@
     <main class="main-container">
         <!-- Active Signals Banner -->
         <section class="active-signals-section">
-            <h2>ACTIVE SIGNALS (5M / 1M Expiry)</h2>
+            <h2>ACTIVE SIGNALS (1M Expiry)</h2>
             <div id="active-signals-grid" class="active-grid">
                 <div class="no-signal-card">Waiting for high-confluence signals...</div>
             </div>
@@ -66,9 +66,13 @@
             </div>
         </section>
 
+        <section class="history-section">
+            <h2>Latest scan: signal or skip reason</h2>
+            <pre id="evaluation-status" style="white-space:pre-wrap">Waiting for scan...</pre>
+        </section>
         <!-- Signal History -->
         <section class="history-section">
-            <h2>Signal History & Outcomes</h2>
+            <h2>Signal History & Outcomes</h2><p id="history-error" role="status"></p>
             <div class="table-responsive">
                 <table class="data-table">
                     <thead>
@@ -78,9 +82,9 @@
                             <th>Direction</th>
                             <th>Score</th>
                             <th>Quality</th>
-                            <th>15M Bias</th>
+                            <th>Context</th>
                             <th>Entry</th>
-                            <th>Expiry</th>
+                            <th>Exit price</th>
                             <th>Result</th>
                         </tr>
                     </thead>
@@ -107,6 +111,7 @@
             async function fetchDashboardData() {
                 try {
                     const res = await fetch('/api/dashboard');
+                    if (!res.ok) throw new Error('Dashboard HTTP ' + res.status);
                     const data = await res.json();
                     
                     const connEl = document.getElementById('connection-status');
@@ -135,27 +140,52 @@
                         if (winrateEl) winrateEl.innerText = (p.win_rate || 0) + '%';
                     }
 
+                } catch (e) {
+                    console.error("Dashboard fetch error:", e);
+                }
+            }
+
+
+            async function fetchHistory() {
+                try {
                     const historyRes = await fetch('/api/history');
+                    if (!historyRes.ok) throw new Error('History HTTP ' + historyRes.status);
                     const historyData = await historyRes.json();
                     const historyBody = document.getElementById('history-table-body');
+                    if (historyBody && historyData.length === 0) historyBody.innerHTML = '<tr><td colspan=9>No saved signals yet.</td></tr>';
                     if (historyBody && historyData && historyData.length > 0) {
                         historyBody.innerHTML = historyData.map(row => `
                             <tr>
                                 <td>${row.timestamp ? row.timestamp.substring(11, 19) : '--'}</td>
                                 <td><strong>${row.pair}</strong></td>
                                 <td><span class="badge ${row.direction.toLowerCase()}">${row.direction}</span></td>
-                                <td>${row.score}/11</td>
+                                <td>${row.score}/8</td>
                                 <td>${row.quality}</td>
                                 <td>${row.bias}</td>
                                 <td>${row.price ? row.price.toFixed(5) : '--'}</td>
                                 <td>${row.exit_price ? row.exit_price.toFixed(5) : '--'}</td>
-                                <td><span class="result-badge ${row.result.toLowerCase()}">${row.result}</span></td>
+                                <td><span class="result-badge ${row.result.toLowerCase()}">${row.result}</span><br>${row.delivery_status || "SENT"}</td>
                             </tr>
                         `).join('');
                     }
+
                 } catch (e) {
-                    console.error("Dashboard fetch error:", e);
+                    document.getElementById('history-error').textContent = 'History unavailable; retrying. ' + e.message;
+                    return;
                 }
+                document.getElementById('history-error').textContent = '';
+            }
+
+            async function fetchEvaluations() {
+                const output = document.getElementById('evaluation-status');
+                try {
+                    const response = await fetch('/api/evaluations');
+                    if (!response.ok) throw new Error('HTTP ' + response.status);
+                    const evaluations = await response.json();
+                    output.textContent = Object.entries(evaluations).map(([pair, row]) =>
+                        `${pair}: ${row.direction} | ${row.score}/8 | ${row.score_reason} | ${row.delivery} | ${row.timestamp}`
+                    ).join('\n') || 'Waiting for first scan...';
+                } catch (e) { output.textContent = 'Scan status unavailable: ' + e.message; }
             }
 
             async function fetchActiveSignals() {
@@ -177,10 +207,10 @@
                                     <span class="badge ${sig.direction.toLowerCase()}">${sig.direction}</span>
                                 </div>
                                 <div class="card-body">
-                                    <p>Score: <strong>${sig.score}/11</strong> (${sig.quality})</p>
-                                    <p>15M Bias: <strong>${sig.bias}</strong></p>
+                                    <p>Score: <strong>${sig.score}/8</strong> (${sig.quality})</p>
+                                    <p>Context: <strong>${sig.bias}</strong></p>
                                     <p>Entry: <strong>${sig.price ? sig.price.toFixed(5) : '--'}</strong></p>
-                                    <p class="status-pending">Status: PENDING (1M Expiry)</p>
+                                    <p class="status-pending">Status: ${sig.result} (${(sig.expiry_seconds || 60) / 60}M Expiry)</p>
                                 </div>
                             </div>
                         `).join('');
@@ -212,10 +242,14 @@
                 }
             }
 
+            setInterval(fetchHistory, 5000);
+            setInterval(fetchEvaluations, 5000);
             setInterval(fetchDashboardData, 5000);
             setInterval(fetchActiveSignals, 3000);
             setInterval(fetchPairs, 3000);
 
+            fetchHistory();
+            fetchEvaluations();
             fetchDashboardData();
             fetchActiveSignals();
             fetchPairs();
@@ -223,3 +257,4 @@
     </script>
 </body>
 </html>
+

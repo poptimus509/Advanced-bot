@@ -1,11 +1,7 @@
-"""
-Strategy engine for QuotexSignalBoard — 1M Optimized Edition.
+"""M1 trend/structure entries, with an explicit strong-pressure M5 override.
 
-Includes:
-  1. Mandatory 5M regime gate (5M_UNAVAILABLE / 5M_NEUTRAL / 5M_REGIME_CONFLICT).
-  2. Anti-Chase Climax Filter (rejects oversized 1.2x ATR candles and post-climax drift).
-  3. Directional RSI velocity/slope scoring.
-  4. Non-repainting price action confirmation.
+Score: trend+structure (2), candle pressure (2), RSI momentum (2),
+support/resistance clearance (2). Mixed structure never trades.
 """
 
 import math
@@ -15,6 +11,7 @@ import pandas as pd
 import numpy as np
 
 import config as cfg
+from indicators import calculate_rsi
 
 logger = logging.getLogger("QuotexSignalBoard.Strategy")
 
@@ -78,12 +75,7 @@ def prepare_history(df: pd.DataFrame) -> pd.DataFrame:
     work["ema_21"] = work["close"].ewm(span=21, adjust=False).mean()
     work["ema_50"] = work["close"].ewm(span=50, adjust=False).mean()
 
-    delta = work["close"].diff()
-    gain = (delta.where(delta > 0, 0.0)).rolling(window=14, min_periods=14).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(window=14, min_periods=14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    work["rsi"] = 100 - (100 / (1 + rs))
-    work["rsi"] = work["rsi"].fillna(50.0)
+    work["rsi"] = calculate_rsi(work["close"], period=14)
 
     work["rsi_slope"] = work["rsi"].diff()
     work["rsi_slope"] = work["rsi_slope"].fillna(0.0)
@@ -345,179 +337,139 @@ def _no_trade(reason: str, epoch: Any = 0) -> Tuple[str, int, str, Dict[str, Any
     }
 
 
-def evaluate_strategy(
-    df: pd.DataFrame,
-    df_5m: Optional[pd.DataFrame] = None,
-    external_context: Any = None,
-) -> Tuple[str, int, str, Dict[str, Any]]:
-    """
-    Evaluates 1M candles with mandatory 5M regime, anti-chase climax, and RSI slope.
-    """
+
+def recent_candle_pressure(df, bullish, atr):
+    """OHLC pressure proxy, not trade volume or order flow."""
+    recent = df.tail(int(getattr(cfg, "RECENT_TREND_CANDLES", 5)))
+    if len(recent) < 5:
+        return False, False
+    sign = 1 if bullish else -1
+    body = (recent["close"] - recent["open"]) * sign
+    ranges = (recent["high"] - recent["low"]).replace(0, np.nan)
+    ratio = body / ranges
+    location = ((recent["close"] - recent["low"]) / ranges if bullish
+                else (recent["high"] - recent["close"]) / ranges)
+    rising = (recent["close"].iloc[-1] - recent["close"].iloc[0]) * sign > 0
+    extrema = ((recent["high"].iloc[-1] - recent["high"].iloc[0]) * sign > 0
+               and (recent["low"].iloc[-1] - recent["low"].iloc[0]) * sign > 0)
+    aligned = bool((body > 0).sum() >= 3 and rising and extrema
+                   and body.iloc[-1] > 0 and location.iloc[-1] >= 0.65)
+    strong_bars = (ratio >= getattr(cfg, "STRONG_PRESSURE_BODY_RATIO", 0.60)) & (location >= 0.75)
+    last_three = recent.tail(3)
+    pressure_move = (last_three["close"].iloc[-1] - last_three["open"].iloc[0]) * sign
+    strong = bool(aligned and strong_bars.tail(3).sum() >= 2
+                  and strong_bars.iloc[-1]
+                  and (body.tail(2) > 0).all()
+                  and pressure_move >= 0.5 * atr)
+    return aligned, strong
+
+
+def support_resistance_context(df, swings, close, atr, bullish):
+    """Use already closed prior bars; do not count the signal bar as its own barrier."""
+    lookback = int(getattr(cfg, "SR_LOOKBACK_CANDLES", 30))
+    prior = df.iloc[:-1].tail(lookback)
+    cutoff = len(df) - lookback - 1
+    highs = [s["price"] for s in swings if s["type"] == "HIGH" and s["index"] >= cutoff]
+    lows = [s["price"] for s in swings if s["type"] == "LOW" and s["index"] >= cutoff]
+    highs.append(float(prior["high"].max()))
+    lows.append(float(prior["low"].min()))
+    resistance = min((v for v in highs if v >= close), default=None)
+    support = max((v for v in lows if v <= close), default=None)
+    clearance = float(getattr(cfg, "SR_CLEARANCE_ATR", 0.25)) * atr
+    distance = (resistance - close if resistance is not None else math.inf) if bullish else (
+        close - support if support is not None else math.inf)
+    return distance > clearance, support, resistance
+
+
+# Compatibility for the earlier public candle helper.
+candle_reaction = continuation_candle
+
+
+def evaluate_strategy(df, df_5m=None, external_context=None):
     if df is None or df.empty or len(df) < MIN_ROWS:
-        return _no_trade("INSUFFICIENT_DATA", 0)
-
+        return _no_trade("INSUFFICIENT_DATA")
     prepared = prepare_history(df)
-    if prepared is None or prepared.empty or len(prepared) < MIN_ROWS:
-        return _no_trade("INSUFFICIENT_DATA_AFTER_GAP_TRIM", 0)
-
-    last_row = prepared.iloc[-1]
-    prev_row = prepared.iloc[-2]
-    epoch = int(last_row["time"]) if "time" in prepared.columns else 0
-
-    if not _row_ohlc_is_valid(last_row):
+    if len(prepared) < max(MIN_ROWS, int(getattr(cfg, "MIN_1M_HISTORY", 20))):
+        return _no_trade("INSUFFICIENT_DATA_AFTER_GAP_TRIM")
+    epoch = int(prepared.iloc[-1].get("time", 0))
+    if not all(_row_ohlc_is_valid(row) for _, row in prepared.iterrows()):
         return _no_trade("INVALID_OHLC", epoch)
+    if "time" in prepared and not (prepared["time"].diff().dropna() == 60).all():
+        return _no_trade("INVALID_1M_SPACING", epoch)
 
-    atr = float(last_row.get("atr", 0.0001))
+    last, prev = prepared.iloc[-1], prepared.iloc[-2]
+    atr = float(last["atr"])
     if not math.isfinite(atr) or atr <= 0:
-        atr = 0.0001
-
-    # ------------------------------------------------------------------
-    # Step A: Anti-Chase Climax Filter
-    # ------------------------------------------------------------------
-    last_body = abs(float(last_row["close"]) - float(last_row["open"]))
-    prev_body = abs(float(prev_row["close"]) - float(prev_row["open"]))
-
-    # Reject if last candle > 1.2 * ATR
-    if last_body > 1.2 * atr:
+        return _no_trade("NO_PRICE_MOVEMENT", epoch)
+    body = abs(float(last["close"] - last["open"]))
+    if body > 1.2 * atr:
         return _no_trade("CLIMAX_CANDLE", epoch)
-
-    # Reject weak drift after strong climax
-    if prev_body > 1.5 * atr and last_body < 0.5 * atr:
+    if abs(float(prev["close"] - prev["open"])) > 1.5 * atr and body < 0.5 * atr:
         return _no_trade("POST_CLIMAX_DRIFT", epoch)
 
-    curr_close = float(last_row["close"])
-    ema_9 = float(last_row.get("ema_9", curr_close))
-    ema_21 = float(last_row.get("ema_21", curr_close))
-    ema_50 = float(last_row.get("ema_50", curr_close))
-
-    swings = confirmed_swings(prepared)
+    # Confirmed pivots need more than the five recent pressure candles.
+    context = prepared.tail(int(getattr(cfg, "STRUCTURE_LOOKBACK_CANDLES", 60))).reset_index(drop=True)
+    swings = confirmed_swings(context)
     structure = _structure_from_swings(swings)
-    activity = activity_pressure(prepared)
-
-    rsi = prepared["rsi"]
-    curr_rsi = float(last_row.get("rsi", 50.0))
-    prev_rsi = float(prev_row.get("rsi", 50.0))
-
-    bias_1m = _trend_bias_1m(prepared)
+    trend = _trend_bias_1m(prepared)
     trend_5m = _safe_5m_bias(df_5m)
-
-    call_score = 0
-    put_score = 0
-    call_reasons: List[str] = []
-    put_reasons: List[str] = []
-
-    # ------------------------------------------------------------------
-    # Step B: Scoring Engine with Directional RSI Slope
-    # ------------------------------------------------------------------
-    # CALL side scoring
-    if bias_1m == "BULLISH" or (trend_5m == "BULLISH" and bias_1m != "BEARISH"):
-        call_score += 2
-        call_reasons.append("TREND_UP_1M")
-
-        if _pullback_detected(rsi, want_bullish=True):
-            call_score += 2
-            call_reasons.append("RSI_PULLBACK_40_50")
-
-        cont = continuation_candle(last_row, prev_row, want_bullish=True)
-        if cont is not None:
-            call_score += 2
-            call_reasons.append("BULLISH_CONTINUATION")
-
-        rsi_call_min = float(getattr(cfg, "RSI_PULLBACK_CALL_MIN", 40.0))
-        rsi_call_max = float(getattr(cfg, "RSI_PULLBACK_CALL_MAX", 50.0))
-        if rsi_call_min < curr_rsi < rsi_call_max and curr_rsi > prev_rsi:
-            call_score += 2
-            call_reasons.append("RSI_SLOPE_RISING")
-
-        if structure == "HH_HL":
-            call_reasons.append("STRUCTURE_HH_HL")
-
-    # PUT side scoring
-    if bias_1m == "BEARISH" or (trend_5m == "BEARISH" and bias_1m != "BULLISH"):
-        put_score += 2
-        put_reasons.append("TREND_DOWN_1M")
-
-        if _pullback_detected(rsi, want_bullish=False):
-            put_score += 2
-            put_reasons.append("RSI_PULLBACK_50_60")
-
-        cont = continuation_candle(last_row, prev_row, want_bullish=False)
-        if cont is not None:
-            put_score += 2
-            put_reasons.append("BEARISH_CONTINUATION")
-
-        rsi_put_min = float(getattr(cfg, "RSI_PULLBACK_PUT_MIN", 50.0))
-        rsi_put_max = float(getattr(cfg, "RSI_PULLBACK_PUT_MAX", 60.0))
-        if rsi_put_min < curr_rsi < rsi_put_max and curr_rsi < prev_rsi:
-            put_score += 2
-            put_reasons.append("RSI_SLOPE_FALLING")
-
-        if structure == "LH_LL":
-            put_reasons.append("STRUCTURE_LH_LL")
-
-    call_score = min(call_score, 8)
-    put_score = min(put_score, 8)
-
-    if call_score == put_score:
-        final_score = call_score
-        direction_candidate = "NONE"
-    elif call_score > put_score:
-        final_score = call_score
-        direction_candidate = "CALL"
+    details = _no_trade("WAITING_SETUP", epoch)[3]
+    details.update(structure=structure, trend_1m=trend,
+                   trend_5m=trend_5m or "UNAVAILABLE", atr=atr,
+                   **activity_pressure(prepared))
+    if structure == "HH_HL" and trend == "BULLISH":
+        candidate, bullish = "CALL", True
+    elif structure == "LH_LL" and trend == "BEARISH":
+        candidate, bullish = "PUT", False
     else:
-        final_score = put_score
-        direction_candidate = "PUT"
+        details["score_reason"] = "MIXED_OR_CONFLICTING_1M_STRUCTURE"
+        return "NO_TRADE", 0, "WAIT", details
 
-    if final_score >= 7:
-        quality = "A_PLUS"
-    elif final_score >= 5:
-        quality = "STANDARD"
-    elif final_score >= 3:
-        quality = "MODERATE"
-    else:
-        quality = "WAIT"
+    close = float(last["close"])
+    relevant = [s for s in swings if s["type"] == ("LOW" if bullish else "HIGH")]
+    if not relevant or (bullish and close <= relevant[-1]["price"]) or (
+            not bullish and close >= relevant[-1]["price"]):
+        details["score_reason"] = "STRUCTURE_LEVEL_BROKEN"
+        return "NO_TRADE", 0, "WAIT", details
 
-    signal_threshold = getattr(cfg, "SIGNAL_THRESHOLD_CALL_PUT", 7)
+    pressure, strong = recent_candle_pressure(prepared, bullish, atr)
+    safe_level, support, resistance = support_resistance_context(context, swings, close, atr, bullish)
+    current_rsi, previous_rsi = float(last["rsi"]), float(prev["rsi"])
+    momentum = False
+    if math.isfinite(current_rsi) and math.isfinite(previous_rsi):
+        # Recovery is allowed to leave the old pullback band.
+        momentum = ((current_rsi >= 50 and (current_rsi > previous_rsi or
+                     (strong and current_rsi >= 55 and current_rsi == previous_rsi))) if bullish else
+                    (current_rsi <= 50 and (current_rsi < previous_rsi or
+                     (strong and current_rsi <= 45 and current_rsi == previous_rsi))))
+    score = 2 + 2 * int(pressure) + 2 * int(momentum) + 2 * int(safe_level)
+    reasons = ["STRUCTURE_" + structure, "TREND_" + trend + "_1M"]
+    reasons.extend(name for ok, name in [(pressure, "CANDLE_PRESSURE"), (momentum, "RSI_MOMENTUM"),
+                                          (safe_level, "SR_CLEAR")] if ok)
+    details.update(call_score=score if bullish else 0, put_score=score if not bullish else 0,
+                   support=support, resistance=resistance, strong_pressure=strong,
+                   pressure_basis="OHLC_PROXY", setup_id=f"{candidate}_{epoch}_{score}",
+                   rank_strength=score * 10 + body / atr, pa=trend, m5_override=False)
     direction = "NO_TRADE"
-    score_reason = "+".join((call_reasons if direction_candidate == "CALL" else put_reasons)[:3]) or "WAITING_SETUP"
-
-    # ------------------------------------------------------------------
-    # Step C: Mandatory 5M Regime & ADX Gates
-    # ------------------------------------------------------------------
-    if direction_candidate in ("CALL", "PUT") and final_score >= signal_threshold:
-        adx_5m = _safe_adx(external_context)
-        min_adx = getattr(cfg, "MIN_ADX_5M", 20.0)
-
-        gate_reason = None
-        if trend_5m is None:
-            gate_reason = "5M_UNAVAILABLE"
-        elif trend_5m == "NEUTRAL":
-            gate_reason = "5M_NEUTRAL"
+    reason = "+".join(reasons)
+    if not pressure:
+        reason = "RECENT_1M_PRESSURE_WEAK"
+    elif not safe_level:
+        reason = "RESISTANCE_TOO_CLOSE" if bullish else "SUPPORT_TOO_CLOSE"
+    elif not momentum:
+        reason = "RSI_MOMENTUM_NOT_CONFIRMED"
+    elif score < int(getattr(cfg, "SIGNAL_THRESHOLD_CALL_PUT", 8)):
+        reason = "SCORE_BELOW_THRESHOLD"
+    else:
+        adx = _safe_adx(external_context)
+        aligned_5m = trend_5m == trend and adx is not None and adx >= getattr(cfg, "MIN_ADX_5M", 20)
+        if aligned_5m:
+            direction = candidate
+        elif strong and getattr(cfg, "ALLOW_STRONG_1M_OVERRIDE", True):
+            direction = candidate
+            details["m5_override"] = True
+            reason += "+STRONG_1M_OVERRIDE"
         else:
-            wanted = "BULLISH" if direction_candidate == "CALL" else "BEARISH"
-            if trend_5m != wanted:
-                gate_reason = "5M_REGIME_CONFLICT"
-
-        if gate_reason is None and (adx_5m is None or adx_5m < min_adx):
-            gate_reason = "ADX_UNAVAILABLE_OR_LOW"
-
-        if gate_reason is None:
-            direction = direction_candidate
-        else:
-            score_reason = gate_reason
-
-    details = {
-        "score_reason": score_reason,
-        "structure": structure,
-        "trend_5m": trend_5m or "UNAVAILABLE",
-        "call_score": call_score,
-        "put_score": put_score,
-        "atr": atr,
-        "setup_id": f"{direction_candidate}_{epoch}_{final_score}",
-        "signal_candle_epoch": epoch,
-        "rank_strength": final_score * 10 + abs(ema_9 - ema_21) / atr,
-        "pa": "BULLISH" if direction_candidate == "CALL" else ("BEARISH" if direction_candidate == "PUT" else "NEUTRAL"),
-        **activity,
-    }
-
-    return direction, final_score, quality, details
+            reason = "5M_NOT_CONFIRMED_AND_1M_PRESSURE_NOT_STRONG"
+    details["score_reason"] = reason
+    return direction, score, "A_PLUS" if score == 8 else "WAIT", details

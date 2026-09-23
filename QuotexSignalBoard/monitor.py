@@ -35,7 +35,7 @@ def get_today_performance():
         SUM(CASE WHEN result = 'PENDING' THEN 1 ELSE 0 END) as pending,
         SUM(CASE WHEN result = 'UNKNOWN' THEN 1 ELSE 0 END) as unknown
     FROM signal_history
-    WHERE substr(signal_timestamp_bdt, 1, 10) = ?
+    WHERE substr(signal_timestamp_bdt, 1, 10) = ? AND delivery_status = 'SENT'
     """, (today_bdt,))
     
     row = cursor.fetchone()

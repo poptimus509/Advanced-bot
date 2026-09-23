@@ -42,7 +42,7 @@ STALE_TICK_THRESHOLD_SEC = 25.0
 # ------------------------------------------------------------------
 # STRATEGY TUNING & 24/7 EXECUTION TIMING
 # ------------------------------------------------------------------
-SIGNAL_THRESHOLD_CALL_PUT = 7
+SIGNAL_THRESHOLD_CALL_PUT = 8
 EXPIRY_SECONDS = 60
 
 # Payout settings
@@ -52,6 +52,12 @@ MIN_PAYOUT_PERCENT = 85.0
 # 5M Regime Gate & Volatility
 CONTEXT_5M_MIN_CANDLES = 10
 MIN_ADX_5M = 20.0
+RECENT_TREND_CANDLES = 5
+STRUCTURE_LOOKBACK_CANDLES = 60
+SR_LOOKBACK_CANDLES = 30
+SR_CLEARANCE_ATR = 0.25
+STRONG_PRESSURE_BODY_RATIO = 0.60
+ALLOW_STRONG_1M_OVERRIDE = True
 
 # Pullback / Entry Boundaries
 RSI_PULLBACK_CALL_MIN = 40.0
@@ -77,6 +83,8 @@ SIGNAL_HOURS_UTC = (0, 24)
 # Auto-filter guards
 AUTO_FILTER_MIN_TRADES = 30
 AUTO_FILTER_MIN_WIN_RATE = 0.50
+# Reassess recent performance; old losing history must not ban pairs forever.
+AUTO_FILTER_LOOKBACK_HOURS = 24
 
 # Active Real-Market Forex Pairs
 FOREX_PAIRS = {

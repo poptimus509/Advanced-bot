@@ -126,13 +126,13 @@ def symbol_in_cooldown(symbol: str, cooldown_minutes: int) -> bool:
     conn = get_db_connection()
     try:
         row = conn.execute(
-            "SELECT candle_epoch FROM signal_history WHERE symbol = ? ORDER BY candle_epoch DESC LIMIT 1",
+            "SELECT candle_epoch FROM signal_history WHERE symbol = ? AND delivery_status = 'SENT' ORDER BY candle_epoch DESC LIMIT 1",
             (symbol,),
         ).fetchone()
-        if not row or not row["candle_epoch"]:
+        if not row or not row[0]:
             return False
         server_now = deriv_client.get_server_time()
-        return (server_now - int(row["candle_epoch"])) < (cooldown_minutes * 60)
+        return (server_now - int(row[0])) < (cooldown_minutes * 60)
     finally:
         conn.close()
 
@@ -220,9 +220,11 @@ def refresh_auto_disabled_pairs():
                    SUM(CASE WHEN result = 'WIN' THEN 1 ELSE 0 END) AS wins,
                    SUM(CASE WHEN result = 'LOSS' THEN 1 ELSE 0 END) AS losses
             FROM signal_history
-            WHERE result IN ('WIN', 'LOSS')
+            WHERE result IN ('WIN', 'LOSS') AND delivery_status = 'SENT'
+              AND candle_epoch >= ?
             GROUP BY symbol
-            """
+            """,
+            (int(deriv_client.get_server_time()) - int(getattr(cfg, "AUTO_FILTER_LOOKBACK_HOURS", 24)) * 3600,),
         ).fetchall()
     finally:
         conn.close()
@@ -289,7 +291,7 @@ def make_tick_handler(symbol, manager):
 
                     if window is None:
                         window = {
-                            "count": 0,
+                            "count": 1,
                             "first": epoch,
                             "last": epoch,
                             "last_receipt": monotonic_now,
@@ -345,17 +347,6 @@ def live_quote(symbol):
             if v in live_state:
                 quote = live_state[v]
                 break
-
-        if quote is None:
-            manager = candle_managers.get(symbol)
-            if manager:
-                last_c = manager.get_latest_closed_candle("1M")
-                if last_c:
-                    quote = {
-                        "epoch": int(last_c.close_epoch),
-                        "price": float(last_c.close),
-                        "receipt": time.monotonic(),
-                    }
 
         if quote is None:
             return None
@@ -465,12 +456,15 @@ def send_telegram_alert(candidate, target_epoch):
         "⚡️ <b>QUOTEX 1M HIGH-SPEED SIGNAL</b> ⚡️\n\n"
         f"📊 <b>Pair:</b> {candidate['display_name']}\n"
         f"🎯 <b>Action:</b> <b>{candidate['direction']}</b>\n"
-        f"⭐️ <b>Score:</b> {candidate['score']}/{getattr(cfg, 'SIGNAL_THRESHOLD_CALL_PUT', 7)} ({candidate['quality']})\n"
+        f"⭐️ <b>Score:</b> {candidate['score']}/8 ({candidate['quality']})\n"
         f"⏰ <b>Expiry:</b> {expiry.strftime('%H:%M:%S')} {getattr(cfg, 'TIMEZONE_NAME', 'Asia/Dhaka')} (1M)\n"
-        f"💰 <b>Min Payout:</b> {PAYOUT_PERCENT:.0f}%\n"
+        f"💰 <b>Configured Payout:</b> {PAYOUT_PERCENT:.0f}%\n"
+        f"📈 <b>M1 Structure:</b> {details.get('structure', 'N/A')}\n"
         f"{trend_line}"
+        f"🔎 <b>Strong M1 override:</b> {details.get('m5_override', False)}\n"
         f"💡 <b>Reason:</b> {details.get('score_reason', 'N/A')}\n\n"
-        "⚠️ <b>Enter within first 10–15 seconds of the new candle.</b>"
+        "⚠️ Expiry is the displayed minute boundary, not 60 seconds after receipt.\n"
+        "Prices and hypothetical outcomes use Deriv, not Quotex's own feed."
     )
 
     url = f"https://api.telegram.org/bot{cfg.TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -494,7 +488,7 @@ def send_telegram_alert(candidate, target_epoch):
 # SIGNAL RECORDING & DISPATCH (PAYOUT & EXPECTANCY TRACKING)
 # ============================================================
 
-def save_signal(candidate, target_epoch, entry_price):
+def save_signal(candidate, target_epoch, entry_price, delivery_status="SENT"):
     tz = pytz.timezone(getattr(cfg, "TIMEZONE_NAME", "Asia/Dhaka"))
     utc_now = datetime.datetime.now(datetime.timezone.utc)
     local_now = utc_now.astimezone(tz)
@@ -508,9 +502,9 @@ def save_signal(candidate, target_epoch, entry_price):
                 signal_id, symbol, display_pair, timeframe, candle_epoch,
                 signal_timestamp_utc, signal_timestamp_bdt, direction, score, quality,
                 bias_15m, entry_reference_price, entry_reference_timestamp, created_at, result,
-                payout_percent, expiry_seconds
+                payout_percent, expiry_seconds, delivery_status
             )
-            VALUES (?, ?, ?, '1M', ?, ?, ?, ?, ?, ?, 'NOT_USED', ?, ?, ?, 'PENDING', ?, ?)
+            VALUES (?, ?, ?, '1M', ?, ?, ?, ?, ?, ?, 'NOT_USED', ?, ?, ?, 'PENDING', ?, ?, ?)
             """,
             (
                 signal_id,
@@ -527,6 +521,7 @@ def save_signal(candidate, target_epoch, entry_price):
                 local_now.isoformat(),
                 PAYOUT_PERCENT,
                 EXPIRY_SECONDS,
+                delivery_status,
             ),
         )
         conn.commit()
@@ -537,7 +532,10 @@ def save_signal(candidate, target_epoch, entry_price):
 def dispatch_best_signal(candidate, target_epoch):
     quote = live_quote(candidate["symbol"])
     if quote is None:
-        quote = {"price": candidate["analysis_close"], "epoch": target_epoch}
+        return "STALE_QUOTE"
+    now = deriv_client.get_server_time()
+    if not target_epoch <= now <= target_epoch + cfg.MAX_ENTRY_DELAY_SECONDS:
+        return "ENTRY_WINDOW_EXPIRED"
 
     if not getattr(cfg, "TELEGRAM_ENABLED", False):
         return "DISABLED"
@@ -545,14 +543,28 @@ def dispatch_best_signal(candidate, target_epoch):
     if not reserve_dispatch(candidate["symbol"], candidate["details"]["setup_id"], target_epoch):
         return "DUPLICATE"
 
+    # Store before delivery; never send an alert when its history cannot be saved.
+    try:
+        save_signal(candidate, target_epoch, quote["price"], "ATTEMPTING")
+    except Exception:
+        logger.exception("Signal storage failed; alert not sent")
+        set_dispatch_status(target_epoch, "STORE_FAILED")
+        return "STORE_FAILED"
+
     status = send_telegram_alert(candidate, target_epoch)
+    conn = get_db_connection()
+    try:
+        result = "PENDING" if status == "SENT" else "UNKNOWN" if status == "UNKNOWN" else "NOT_SENT"
+        conn.execute(
+            "UPDATE signal_history SET delivery_status = ?, result = ? WHERE signal_id = ?",
+            (status, result, f"{candidate['symbol']}_1M_{target_epoch}"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     set_dispatch_status(target_epoch, status)
 
     if status == "SENT":
-        try:
-            save_signal(candidate, target_epoch, quote["price"])
-        except Exception:
-            logger.exception("save_signal failed for %s", candidate["symbol"])
 
         if pusher_client:
             try:
@@ -630,7 +642,7 @@ def evaluate_and_dispatch_all(target_epoch):
                 df = prepare_history(raw_df) if not raw_df.empty else raw_df
 
                 if not df.empty and "time" in df.columns:
-                    df = df[df["time"] <= target_epoch].reset_index(drop=True)
+                    df = df[df["time"] < target_epoch].reset_index(drop=True)
 
                 min_history = getattr(cfg, "MIN_1M_HISTORY", 20)
                 if df.empty or len(df) < min_history:
@@ -667,6 +679,11 @@ def evaluate_and_dispatch_all(target_epoch):
                     "put_score": details.get("put_score", 0),
                     "activity_status": details.get("activity_status", "ACTIVE"),
                     "relative_activity": details.get("relative_activity", 1.0),
+                    "trend_1m": details.get("trend_1m"),
+                    "strong_pressure": details.get("strong_pressure", False),
+                    "m5_override": details.get("m5_override", False),
+                    "support": details.get("support"),
+                    "resistance": details.get("resistance"),
                     "analysis_candle_epoch": int(df.iloc[-1]["time"]),
                 })
 
@@ -685,6 +702,7 @@ def evaluate_and_dispatch_all(target_epoch):
                         })
 
             except Exception as exc:
+                logger.exception("Evaluation failed for %s", symbol)
                 report["score_reason"] = f"DATA_ERROR:{type(exc).__name__}"
 
             reports[display] = report
@@ -702,6 +720,11 @@ def evaluate_and_dispatch_all(target_epoch):
             status = dispatch_best_signal(best_candidate, target_epoch)
             reports[best_candidate["display_name"]]["delivery"] = status
 
+        reason_counts = {}
+        for report in reports.values():
+            reason = report.get("score_reason", "UNKNOWN")
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        logger.info("Scan pairs=%s candidates=%s reasons=%s", len(reports), len(candidates), reason_counts)
         with state_lock:
             latest_evaluations.clear()
             latest_evaluations.update(reports)
@@ -747,12 +770,6 @@ def resync_historical_candles():
             with state_lock:
                 if raw_1m:
                     manager.seed_historical_candles("1M", raw_1m, server_epoch)
-                    last_c = raw_1m[-1]
-                    clean = symbol.replace("frx", "").replace("/", "").upper()
-                    ep = int(last_c.get("epoch") or last_c.get("time") or server_epoch)
-                    cl = float(last_c.get("close", 0))
-                    for k in [symbol, clean, f"frx{clean}"]:
-                        live_state[k] = {"epoch": ep, "price": cl, "receipt": time.monotonic()}
                 if raw_5m:
                     manager.seed_historical_candles("5M", raw_5m, server_epoch)
             updated += 1
@@ -888,16 +905,18 @@ def run_outcome_worker():
             conn = get_db_connection()
             rows = conn.execute(
                 """
-                SELECT signal_id, symbol, candle_epoch, direction, entry_reference_price
+                SELECT signal_id, symbol, candle_epoch, direction, entry_reference_price,
+                       expiry_seconds, timeframe
                 FROM signal_history
-                WHERE result = 'PENDING'
+                WHERE result = 'PENDING' AND delivery_status = 'SENT'
                 """
             ).fetchall()
 
             now = deriv_client.get_server_time()
 
-            for signal_id, symbol, target, direction, entry in rows:
-                exit_candle_epoch = int(target) + EXPIRY_SECONDS - 60
+            for signal_id, symbol, target, direction, entry, saved_expiry, timeframe in rows:
+                duration = int(saved_expiry or (300 if timeframe == "5M" else 60))
+                exit_candle_epoch = int(target) + duration - 60
                 if not entry or symbol not in candle_managers or now < exit_candle_epoch + 60 + 5:
                     continue
 
@@ -1020,11 +1039,11 @@ def signal_rows(active_only=False):
             SELECT signal_id, display_pair, timeframe, signal_timestamp_bdt,
                    direction, score, quality, bias_15m, entry_reference_price,
                    exit_reference_price, result, candle_epoch, payout_percent,
-                   expiry_seconds
+                   expiry_seconds, delivery_status
             FROM signal_history
         """
         if active_only:
-            query += " WHERE result = 'PENDING'"
+            query += " WHERE result = 'PENDING' AND delivery_status = 'SENT'"
         query += " ORDER BY candle_epoch DESC LIMIT 50"
         rows = conn.execute(query).fetchall()
     finally:
@@ -1047,6 +1066,8 @@ def signal_rows(active_only=False):
             "target_candle_epoch": row[11],
             "payout_percent": row[12],
             "expiry_seconds": row[13],
+            "expiry_epoch": int(row[11]) + int(row[13] or (300 if row[2] == "5M" else 60)),
+            "delivery_status": row[14],
             "performance_basis": "hypothetical Deriv reference prices",
         }
         for row in rows

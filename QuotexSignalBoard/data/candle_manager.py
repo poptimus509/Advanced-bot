@@ -207,7 +207,9 @@ class CandleManager:
                         htf_epoch = next_1m_boundary - htf_sec
                         constituent_candles = [c for c in self._mtf_1m_buffer[htf] if c.epoch >= htf_epoch]
 
-                        if constituent_candles:
+                        expected_epochs = list(range(htf_epoch, next_1m_boundary, 60))
+                        complete = sorted(c.epoch for c in constituent_candles) == expected_epochs
+                        if complete:
                             htf_candle = Candle(
                                 symbol=self.symbol,
                                 timeframe=htf,
@@ -220,7 +222,10 @@ class CandleManager:
                                 ticks_count=sum(c.ticks_count for c in constituent_candles),
                                 close_epoch=next_1m_boundary
                             )
-                            self._closed_candles[htf].append(htf_candle)
+                            merged = {c.epoch: c for c in self._closed_candles[htf]}
+                            merged[htf_epoch] = htf_candle
+                            self._closed_candles[htf] = deque(
+                                sorted(merged.values(), key=lambda c: c.epoch), maxlen=self.max_history)
                             # Prune the MTF buffer at every 5M close.
                             self._mtf_1m_buffer[htf] = [
                                 c for c in self._mtf_1m_buffer[htf]
@@ -239,6 +244,9 @@ class CandleManager:
                             setattr(ev_htf, "epoch", htf_candle.epoch)
                             closed_mtf_events_to_dispatch.append(ev_htf)
 
+                        self._mtf_1m_buffer[htf] = [
+                            c for c in self._mtf_1m_buffer[htf] if c.epoch >= next_1m_boundary]
+
                 self._forming_candles["1M"] = {
                     "epoch": candle_start,
                     "open": price,
@@ -247,7 +255,7 @@ class CandleManager:
                     "close": price,
                     "ticks_count": 1
                 }
-            else:
+            elif candle_start == curr_1m["epoch"]:
                 curr_1m["high"] = max(curr_1m["high"], price)
                 curr_1m["low"] = min(curr_1m["low"], price)
                 curr_1m["close"] = price
